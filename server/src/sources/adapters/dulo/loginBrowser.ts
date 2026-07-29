@@ -1,5 +1,5 @@
 // DuloLoginBrowser — a server-launched real Chromium, streamed into the SPA so the user signs in to the
-// ACTUAL dulo.tv login page rendered server-side. Their password goes straight into dulo and never touches
+// ACTUAL dulo.gd login page rendered server-side. Their password goes straight into dulo and never touches
 // Masqueradarr (preserving the "tokens only, never a password" invariant in auth.ts / models/PlaylistAuth.ts). The
 // resulting Supabase session is intercepted from the page's network (or localStorage) and handed to
 // duloAuth.signIn() — the SAME capture pipeline the old bookmarklet fed, just without the bookmarklet.
@@ -10,7 +10,7 @@
 // Google" gate blocks headless. The same CDP session lets us read the token call off the page's network.
 //
 // Recon (2026-06-12, see the plan): dulo is a Vite SPA ("amri.gg"); its login is a full page at
-// https://dulo.tv/login (email/password + Google/Discord OAuth); it stores the Supabase session under a
+// https://dulo.gd/login (email/password + Google/Discord OAuth); it stores the Supabase session under a
 // CUSTOM `amri-*` localStorage key (NOT `sb-*-auth-token`); the Supabase URL/anon key live in the bundle and
 // are not exposed before sign-in. So capture is host-agnostic (match the GoTrue token path, read the apikey
 // header) and the localStorage fallback scans every key for a value carrying an access_token.
@@ -20,15 +20,23 @@
 // just degrades this feature), a single session runs at a time, tearing down on capture / WS close / a time cap.
 // The runtime browser + Xvfb dependency is documented in styles-backend.md's Docker contract.
 
-import type { Browser, BrowserContext, Page, CDPSession, HTTPResponse, KeyInput } from 'puppeteer-core';
-import { WebSocket } from 'ws';
-import { duloAuth, type CapturePayload } from './auth.js';
-import { logger } from '../../core/logger.js';
+import type {
+  Browser,
+  BrowserContext,
+  Page,
+  CDPSession,
+  HTTPResponse,
+  KeyInput,
+} from "puppeteer-core";
+import { WebSocket } from "ws";
+import { duloAuth, type CapturePayload } from "./auth.js";
+import { logger } from "../../core/logger.js";
+import { DULO_BASE, DULO_ORIGIN } from "./constants.js";
 
-const tag = 'dulo:login';
-const LOGIN_URL = 'https://dulo.tv/login';
-const LIVE_URL = 'https://dulo.tv/live'; // navigated to after sign-in to provoke the client's activate-device
-const APP_HOST = 'dulo.tv';
+const tag = "dulo:login";
+const LOGIN_URL = `${DULO_ORIGIN}/login`;
+const LIVE_URL = `${DULO_ORIGIN}/live`; // navigated to after sign-in to provoke the client's activate-device
+const APP_HOST = "dulo.gd";
 const VIEWPORT_W = 1280;
 const VIEWPORT_H = 800;
 const HARD_CAP_MS = 5 * 60_000; // a session may not linger past this, even if the WS stays open
@@ -55,7 +63,7 @@ let cachedLauncher: Launcher | null = null;
 // Outbound (server → client) message helpers — text JSON for control, binary for JPEG frames.
 // ──────────────────────────────────────────────────────────────────────
 
-type StreamState = 'connecting' | 'live' | 'captured' | 'busy' | 'error';
+type StreamState = "connecting" | "live" | "captured" | "busy" | "error";
 
 function sendJson(ws: WebSocket, msg: Record<string, unknown>): void {
   if (ws.readyState === WebSocket.OPEN) {
@@ -106,9 +114,13 @@ class DuloLoginBrowser {
   /** Wire a freshly-upgraded WebSocket to a streamed login session. Rejects a second concurrent client. */
   attach(ws: WebSocket): void {
     if (this.current) {
-      sendJson(ws, { type: 'status', state: 'busy', message: 'a dulo login session is already in progress' });
+      sendJson(ws, {
+        type: "status",
+        state: "busy",
+        message: "a dulo login session is already in progress",
+      });
       try {
-        ws.close(1013, 'busy'); // 1013 = Try Again Later
+        ws.close(1013, "busy"); // 1013 = Try Again Later
       } catch {
         /* ignore */
       }
@@ -133,20 +145,20 @@ class DuloLoginBrowser {
     };
     this.current = session;
 
-    ws.on('message', (data, isBinary) => {
+    ws.on("message", (data, isBinary) => {
       if (isBinary) return; // we never expect binary from the client
       void this.handleInput(session, data.toString());
     });
-    ws.on('close', () => void this.teardown(session, 'ws_close'));
-    ws.on('error', () => void this.teardown(session, 'ws_error'));
+    ws.on("close", () => void this.teardown(session, "ws_close"));
+    ws.on("error", () => void this.teardown(session, "ws_error"));
 
-    sendJson(ws, { type: 'status', state: 'connecting' });
+    sendJson(ws, { type: "status", state: "connecting" });
     void this.launch(session);
   }
 
   /** Tear down the single active session (called by shutdown()). */
   async closeAll(): Promise<void> {
-    if (this.current) await this.teardown(this.current, 'shutdown');
+    if (this.current) await this.teardown(this.current, "shutdown");
   }
 
   // ── internals ──────────────────────────────────────────────────────
@@ -164,17 +176,24 @@ class DuloLoginBrowser {
       if (cachedLauncher) {
         puppeteer = cachedLauncher;
       } else {
-        const { addExtra } = (await import('puppeteer-extra')) as unknown as { addExtra(p: unknown): Launcher };
-        const puppeteerCore = (await import('puppeteer-core')).default;
-        const StealthPlugin = (await import('puppeteer-extra-plugin-stealth')).default;
+        const { addExtra } = (await import("puppeteer-extra")) as unknown as {
+          addExtra(p: unknown): Launcher;
+        };
+        const puppeteerCore = (await import("puppeteer-core")).default;
+        const StealthPlugin = (await import("puppeteer-extra-plugin-stealth"))
+          .default;
         puppeteer = addExtra(puppeteerCore);
         puppeteer.use(StealthPlugin());
         cachedLauncher = puppeteer;
       }
     } catch (err) {
       logger.warn(tag, `puppeteer unavailable: ${(err as Error).message}`);
-      sendJson(session.ws, { type: 'status', state: 'error', message: 'streamed login unavailable (browser engine not installed)' });
-      await this.teardown(session, 'no_puppeteer');
+      sendJson(session.ws, {
+        type: "status",
+        state: "error",
+        message: "streamed login unavailable (browser engine not installed)",
+      });
+      await this.teardown(session, "no_puppeteer");
       return;
     }
 
@@ -191,11 +210,11 @@ class DuloLoginBrowser {
         executablePath: process.env.CHROMIUM_PATH || undefined,
         headless: false,
         args: [
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-          '--disable-dev-shm-usage',
-          '--disable-blink-features=AutomationControlled',
-          '--lang=en-US',
+          "--no-sandbox",
+          "--disable-setuid-sandbox",
+          "--disable-dev-shm-usage",
+          "--disable-blink-features=AutomationControlled",
+          "--lang=en-US",
         ],
       });
       // Deliberately NOT setting userAgent: a hardcoded UA (auth.ts's Chrome/124) mismatched the Chromium build
@@ -208,38 +227,56 @@ class DuloLoginBrowser {
       session.context = await session.browser.createBrowserContext();
       const page = await session.context.newPage();
       session.page = page;
-      await page.setViewport({ width: VIEWPORT_W, height: VIEWPORT_H, deviceScaleFactor: 1 });
-      await page.emulateTimezone('America/New_York');
-      await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
+      await page.setViewport({
+        width: VIEWPORT_W,
+        height: VIEWPORT_H,
+        deviceScaleFactor: 1,
+      });
+      await page.emulateTimezone("America/New_York");
+      await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
     } catch (err) {
       logger.error(tag, `launch failed: ${(err as Error).message}`);
-      sendJson(session.ws, { type: 'status', state: 'error', message: 'failed to start the login browser' });
-      await this.teardown(session, 'launch_error');
+      sendJson(session.ws, {
+        type: "status",
+        state: "error",
+        message: "failed to start the login browser",
+      });
+      await this.teardown(session, "launch_error");
       return;
     }
 
     // Capture the Supabase token off the page network — works for the main frame and any OAuth popup.
-    session.page.on('response', (res) => void this.onResponse(session, res));
-    session.page.on('popup', (popup) => {
-      popup?.on('response', (res) => void this.onResponse(session, res));
+    session.page.on("response", (res) => void this.onResponse(session, res));
+    session.page.on("popup", (popup) => {
+      popup?.on("response", (res) => void this.onResponse(session, res));
     });
 
     await this.startScreencast(session);
 
     // Hard cap so an abandoned session can never pin a Chromium open indefinitely.
     session.hardCap = setTimeout(() => {
-      sendJson(session.ws, { type: 'status', state: 'error', message: 'login session timed out' });
-      void this.teardown(session, 'hard_cap');
+      sendJson(session.ws, {
+        type: "status",
+        state: "error",
+        message: "login session timed out",
+      });
+      void this.teardown(session, "hard_cap");
     }, HARD_CAP_MS);
 
     // localStorage fallback: covers an already-signed-in account where no fresh token call fires.
-    session.lsPoll = setInterval(() => void this.pollLocalStorage(session), LS_POLL_MS);
+    session.lsPoll = setInterval(
+      () => void this.pollLocalStorage(session),
+      LS_POLL_MS,
+    );
 
-    sendJson(session.ws, { type: 'meta', w: VIEWPORT_W, h: VIEWPORT_H });
-    sendJson(session.ws, { type: 'status', state: 'live' });
+    sendJson(session.ws, { type: "meta", w: VIEWPORT_W, h: VIEWPORT_H });
+    sendJson(session.ws, { type: "status", state: "live" });
 
     try {
-      await session.page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+      await session.page.goto(LOGIN_URL, {
+        waitUntil: "domcontentloaded",
+        timeout: 30_000,
+      });
     } catch (err) {
       // Don't fail the session on a slow/blocked nav — the screencast shows whatever rendered (incl. a
       // bot-gate/CAPTCHA the user can solve live).
@@ -252,19 +289,24 @@ class DuloLoginBrowser {
     if (!page || !session.context) return;
     try {
       session.cdp = await page.createCDPSession();
-      session.cdp.on('Page.screencastFrame', (frame: { data: string; sessionId: number }) => {
-        // Ack first (always) — an un-acked frame stalls the whole screencast.
-        session.cdp?.send('Page.screencastFrameAck', { sessionId: frame.sessionId }).catch(() => {});
-        if (ws.readyState !== WebSocket.OPEN) return;
-        if (ws.bufferedAmount > WS_BACKPRESSURE_BYTES) return; // client is behind — drop this frame
-        try {
-          ws.send(Buffer.from(frame.data, 'base64'));
-        } catch {
-          /* ignore — close/error handler will tear down */
-        }
-      });
-      await session.cdp.send('Page.startScreencast', {
-        format: 'jpeg',
+      session.cdp.on(
+        "Page.screencastFrame",
+        (frame: { data: string; sessionId: number }) => {
+          // Ack first (always) — an un-acked frame stalls the whole screencast.
+          session.cdp
+            ?.send("Page.screencastFrameAck", { sessionId: frame.sessionId })
+            .catch(() => {});
+          if (ws.readyState !== WebSocket.OPEN) return;
+          if (ws.bufferedAmount > WS_BACKPRESSURE_BYTES) return; // client is behind — drop this frame
+          try {
+            ws.send(Buffer.from(frame.data, "base64"));
+          } catch {
+            /* ignore — close/error handler will tear down */
+          }
+        },
+      );
+      await session.cdp.send("Page.startScreencast", {
+        format: "jpeg",
         quality: 60,
         maxWidth: VIEWPORT_W,
         maxHeight: VIEWPORT_H,
@@ -272,8 +314,12 @@ class DuloLoginBrowser {
       });
     } catch (err) {
       logger.error(tag, `screencast failed: ${(err as Error).message}`);
-      sendJson(ws, { type: 'status', state: 'error', message: 'failed to start the screen stream' });
-      await this.teardown(session, 'screencast_error');
+      sendJson(ws, {
+        type: "status",
+        state: "error",
+        message: "failed to start the screen stream",
+      });
+      await this.teardown(session, "screencast_error");
     }
   }
 
@@ -289,26 +335,31 @@ class DuloLoginBrowser {
       return;
     }
     try {
-      if (msg.type === 'mouse') {
+      if (msg.type === "mouse") {
         const x = clamp(Number(msg.x), VIEWPORT_W);
         const y = clamp(Number(msg.y), VIEWPORT_H);
-        const button = (['left', 'middle', 'right'][Number(msg.button) || 0] ?? 'left') as 'left' | 'middle' | 'right';
-        if (msg.action === 'move') await page.mouse.move(x, y);
-        else if (msg.action === 'down') {
+        const button = (["left", "middle", "right"][Number(msg.button) || 0] ??
+          "left") as "left" | "middle" | "right";
+        if (msg.action === "move") await page.mouse.move(x, y);
+        else if (msg.action === "down") {
           await page.mouse.move(x, y);
           await page.mouse.down({ button });
-        } else if (msg.action === 'up') await page.mouse.up({ button });
-        else if (msg.action === 'wheel') await page.mouse.wheel({ deltaX: Number(msg.dx) || 0, deltaY: Number(msg.dy) || 0 });
-      } else if (msg.type === 'key') {
-        const key = typeof msg.key === 'string' ? msg.key : '';
+        } else if (msg.action === "up") await page.mouse.up({ button });
+        else if (msg.action === "wheel")
+          await page.mouse.wheel({
+            deltaX: Number(msg.dx) || 0,
+            deltaY: Number(msg.dy) || 0,
+          });
+      } else if (msg.type === "key") {
+        const key = typeof msg.key === "string" ? msg.key : "";
         if (!key) return;
         // A single printable char → sendCharacter (dispatches keypress+input for that char, no key-code
         // mapping / modifier tracking — Puppeteer's analog of Playwright's insertText, handles case/symbols).
         // A named key (Enter/Backspace/Tab/Arrow…) → press it.
         if (key.length === 1) await page.keyboard.sendCharacter(key);
         else await page.keyboard.press(key as KeyInput).catch(() => {});
-      } else if (msg.type === 'close') {
-        await this.teardown(session, 'client_close');
+      } else if (msg.type === "close") {
+        await this.teardown(session, "client_close");
       }
     } catch {
       /* a stray input after teardown / navigation — ignore */
@@ -341,14 +392,24 @@ class DuloLoginBrowser {
     // 3. GoTrue session endpoints (host-agnostic — *.supabase.co, a custom auth domain, or proxied):
     //    password/pkce/id_token grants hit /auth/v1/token; magic links hit /auth/v1/verify.
     if (session.captured) return;
-    if (!/\/auth\/v1\/(token|verify)\b/.test(url) && !/\/token\?(?:[^#]*&)?grant_type=/.test(url)) return;
-    let body: { access_token?: string; refresh_token?: string; expires_at?: number; expires_in?: number };
+    if (
+      !/\/auth\/v1\/(token|verify)\b/.test(url) &&
+      !/\/token\?(?:[^#]*&)?grant_type=/.test(url)
+    )
+      return;
+    let body: {
+      access_token?: string;
+      refresh_token?: string;
+      expires_at?: number;
+      expires_in?: number;
+    };
     try {
       body = (await res.json()) as typeof body;
     } catch {
       return; // not JSON (e.g. an error/redirect) — wait for the real token response
     }
-    if (!body || typeof body.access_token !== 'string' || !body.access_token) return;
+    if (!body || typeof body.access_token !== "string" || !body.access_token)
+      return;
 
     let supabaseUrl: string | null = null;
     let anonKey: string | null = null;
@@ -357,7 +418,7 @@ class DuloLoginBrowser {
       // Only trust the response origin as the GoTrue base when it isn't the dulo app host (where it'd be a
       // proxied path); otherwise let duloAuth.signIn derive the base from the JWT `iss` claim.
       if (u.host !== APP_HOST) supabaseUrl = u.origin;
-      anonKey = res.request().headers()['apikey'] ?? null;
+      anonKey = res.request().headers()["apikey"] ?? null;
     } catch {
       /* ignore — signIn backfills from the JWT */
     }
@@ -372,26 +433,39 @@ class DuloLoginBrowser {
   }
 
   /** Intercept dulo's activate-device: read the fingerprint it sends + the deviceId it gets back. */
-  private async onActivateDevice(session: Session, res: HTTPResponse): Promise<void> {
+  private async onActivateDevice(
+    session: Session,
+    res: HTTPResponse,
+  ): Promise<void> {
     if (session.finalized) return;
     const cap: DeviceCapture = { ...(session.deviceCapture ?? {}) };
     try {
       const post = res.request().postData();
       if (post) {
-        const reqBody = JSON.parse(post) as { deviceFingerprint?: string; deviceName?: string };
-        if (typeof reqBody.deviceFingerprint === 'string' && reqBody.deviceFingerprint) {
+        const reqBody = JSON.parse(post) as {
+          deviceFingerprint?: string;
+          deviceName?: string;
+        };
+        if (
+          typeof reqBody.deviceFingerprint === "string" &&
+          reqBody.deviceFingerprint
+        ) {
           cap.deviceFingerprint = reqBody.deviceFingerprint;
         }
-        if (cap.deviceName == null && typeof reqBody.deviceName === 'string') cap.deviceName = reqBody.deviceName;
+        if (cap.deviceName == null && typeof reqBody.deviceName === "string")
+          cap.deviceName = reqBody.deviceName;
       }
     } catch {
       /* no/!JSON body — fingerprint stays unset */
     }
     try {
-      const data = (await res.json()) as { device?: { id?: string; device_name?: string } };
+      const data = (await res.json()) as {
+        device?: { id?: string; device_name?: string };
+      };
       if (data?.device) {
         cap.deviceId = data.device.id ?? null;
-        if (typeof data.device.device_name === 'string') cap.deviceName = data.device.device_name;
+        if (typeof data.device.device_name === "string")
+          cap.deviceName = data.device.device_name;
       }
     } catch {
       /* non-JSON (e.g. an error) response — deviceId stays unset */
@@ -400,7 +474,7 @@ class DuloLoginBrowser {
     session.deviceCapture = cap;
     logger.info(
       tag,
-      `captured dulo device identity (fingerprint=${cap.deviceFingerprint ? 'yes' : 'no'}, id=${cap.deviceId ?? 'none'})`,
+      `captured dulo device identity (fingerprint=${cap.deviceFingerprint ? "yes" : "no"}, id=${cap.deviceId ?? "none"})`,
     );
     if (session.pendingToken) await this.finalize(session); // token already in hand → done
   }
@@ -410,22 +484,31 @@ class DuloLoginBrowser {
     try {
       const post = res.request().postData();
       if (!post) return;
-      const keys = Object.keys(JSON.parse(post) as Record<string, unknown>).sort().join(',');
-      logger.info(tag, `dulo playback-session request keys: [${keys}] (status ${res.status()})`);
+      const keys = Object.keys(JSON.parse(post) as Record<string, unknown>)
+        .sort()
+        .join(",");
+      logger.info(
+        tag,
+        `dulo playback-session request keys: [${keys}] (status ${res.status()})`,
+      );
     } catch {
       /* ignore */
     }
   }
 
   /** Hold the captured token, then wait for the device identity before signing in. */
-  private async onTokenCaptured(session: Session, payload: CapturePayload): Promise<void> {
+  private async onTokenCaptured(
+    session: Session,
+    payload: CapturePayload,
+  ): Promise<void> {
     if (session.captured || session.tornDown) return;
     session.captured = true;
     session.pendingToken = payload;
     sendJson(session.ws, {
-      type: 'status',
-      state: 'live',
-      message: 'Signed in — finishing device setup. If dulo asks, choose to use this device.',
+      type: "status",
+      state: "live",
+      message:
+        "Signed in — finishing device setup. If dulo asks, choose to use this device.",
     });
     if (session.deviceCapture) {
       await this.finalize(session); // device already intercepted (rare ordering) → done
@@ -446,10 +529,16 @@ class DuloLoginBrowser {
     await new Promise((r) => setTimeout(r, 1500));
     if (session.finalized || session.tornDown) return; // device captured (or torn down) during the wait
     try {
-      await page.goto(LIVE_URL, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+      await page.goto(LIVE_URL, {
+        waitUntil: "domcontentloaded",
+        timeout: 30_000,
+      });
     } catch (err) {
       // The screencast still shows whatever rendered (incl. a "use this device" prompt the user can click).
-      logger.warn(tag, `live-tv navigation issue (device provoke): ${(err as Error).message}`);
+      logger.warn(
+        tag,
+        `live-tv navigation issue (device provoke): ${(err as Error).message}`,
+      );
     }
   }
 
@@ -458,7 +547,10 @@ class DuloLoginBrowser {
     if (session.deviceWait) return;
     session.deviceWait = setTimeout(() => {
       if (session.finalized || session.tornDown) return;
-      logger.warn(tag, 'device activation not observed before timeout — finalizing token-only (playback may need re-auth)');
+      logger.warn(
+        tag,
+        "device activation not observed before timeout — finalizing token-only (playback may need re-auth)",
+      );
       void this.finalize(session);
     }, DEVICE_WAIT_MS);
   }
@@ -477,7 +569,9 @@ class DuloLoginBrowser {
     // refresh-token family (not shared with a user tab).
     let userAgent: string | null = null;
     try {
-      userAgent = session.page ? await session.page.evaluate(() => navigator.userAgent) : null;
+      userAgent = session.page
+        ? await session.page.evaluate(() => navigator.userAgent)
+        : null;
     } catch {
       /* page gone — the server default UA is used */
     }
@@ -485,36 +579,49 @@ class DuloLoginBrowser {
       ...session.pendingToken,
       ...(session.deviceCapture ?? {}),
       userAgent,
-      origin: 'streamed',
+      origin: "streamed",
     };
     try {
       const status = await duloAuth.signIn(payload);
-      const how = session.deviceCapture?.deviceFingerprint ? 'with device identity' : 'token-only';
+      const how = session.deviceCapture?.deviceFingerprint
+        ? "with device identity"
+        : "token-only";
       logger.ok(tag, `captured dulo session via streamed login (${how})`);
-      sendJson(session.ws, { type: 'captured', status });
-      sendJson(session.ws, { type: 'status', state: 'captured' });
+      sendJson(session.ws, { type: "captured", status });
+      sendJson(session.ws, { type: "status", state: "captured" });
     } catch (err) {
-      logger.error(tag, `signIn after capture failed: ${(err as Error).message}`);
-      sendJson(session.ws, { type: 'status', state: 'error', message: 'captured the session but failed to store it' });
+      logger.error(
+        tag,
+        `signIn after capture failed: ${(err as Error).message}`,
+      );
+      sendJson(session.ws, {
+        type: "status",
+        state: "error",
+        message: "captured the session but failed to store it",
+      });
     } finally {
       // Give the socket a tick to flush the status frames, then tear down.
-      setTimeout(() => void this.teardown(session, 'captured'), 250);
+      setTimeout(() => void this.teardown(session, "captured"), 250);
     }
   }
 
   private async pollLocalStorage(session: Session): Promise<void> {
     const page = session.page;
     if (!page || session.captured || session.tornDown) return;
-    let found: { accessToken: string; refreshToken: string | null; expiresAt: number | null } | null = null;
+    let found: {
+      accessToken: string;
+      refreshToken: string | null;
+      expiresAt: number | null;
+    } | null = null;
     try {
       found = await page.evaluate(() => {
         for (const k of Object.keys(localStorage)) {
           const v = localStorage.getItem(k);
-          if (!v || v.indexOf('access_token') === -1) continue;
+          if (!v || v.indexOf("access_token") === -1) continue;
           try {
             const o = JSON.parse(v);
             const s = o?.currentSession ?? o?.session ?? o;
-            if (s && typeof s.access_token === 'string' && s.access_token) {
+            if (s && typeof s.access_token === "string" && s.access_token) {
               return {
                 accessToken: s.access_token as string,
                 refreshToken: (s.refresh_token as string) ?? null,
@@ -534,7 +641,11 @@ class DuloLoginBrowser {
       // No anonKey/supabaseUrl from localStorage — signIn derives the base from the JWT `iss` and resolves the
       // anon key via supabaseConfig.currentAnonKey (runtime-discovered → committed seed), so refresh stays
       // durable even on this already-signed-in path (previously this path produced an un-refreshable session).
-      await this.onTokenCaptured(session, { ...found, supabaseUrl: null, anonKey: null });
+      await this.onTokenCaptured(session, {
+        ...found,
+        supabaseUrl: null,
+        anonKey: null,
+      });
     }
   }
 
@@ -546,7 +657,7 @@ class DuloLoginBrowser {
     if (session.lsPoll) clearInterval(session.lsPoll);
     if (session.deviceWait) clearTimeout(session.deviceWait);
     try {
-      await session.cdp?.send('Page.stopScreencast').catch(() => {});
+      await session.cdp?.send("Page.stopScreencast").catch(() => {});
     } catch {
       /* ignore */
     }
@@ -561,7 +672,10 @@ class DuloLoginBrowser {
       /* ignore */
     }
     try {
-      if (session.ws.readyState === WebSocket.OPEN || session.ws.readyState === WebSocket.CONNECTING) {
+      if (
+        session.ws.readyState === WebSocket.OPEN ||
+        session.ws.readyState === WebSocket.CONNECTING
+      ) {
         session.ws.close(1000, reason);
       }
     } catch {

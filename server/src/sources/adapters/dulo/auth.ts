@@ -23,24 +23,29 @@
 // browser tab can invalidate each other's refresh token — re-capture may be needed occasionally. The
 // playbackUrl host + whether its segments need extra headers is the other open unknown (see dulo.ts).
 
-import { randomUUID } from 'node:crypto';
-import { PlaylistAuth as PlaylistAuthModel, type PlaylistAuthDoc } from '../../../models/PlaylistAuth.js';
-import { Playlist } from '../../../models/Playlist.js';
-import { logger } from '../../core/logger.js';
+import { randomUUID } from "node:crypto";
+import {
+  PlaylistAuth as PlaylistAuthModel,
+  type PlaylistAuthDoc,
+} from "../../../models/PlaylistAuth.js";
+import { Playlist } from "../../../models/Playlist.js";
+import { logger } from "../../core/logger.js";
 // Supabase config resolution + runtime discovery. dulo periodically migrates its whole Supabase project
 // (rotating the project URL + public `sb_publishable_` key together); rather than baking those values into
 // env/infra config, we resolve them here (captured-with-session → runtime-discovered → committed seed) and
 // discover the current pair from dulo's live bundle when a refresh 401s at the apikey gate. See supabaseConfig.ts.
-import { currentAnonKey, currentSupabaseUrl, discoverSupabaseConfig } from './supabaseConfig.js';
-
-const DULO_ORIGIN = 'https://dulo.tv';
-const DULO_BASE = process.env.DULO_API_BASE || 'https://dulo.tv/api';
-const DEVICE_NAME = process.env.DULO_DEVICE_NAME || 'Masqueradarr';
+import {
+  currentAnonKey,
+  currentSupabaseUrl,
+  discoverSupabaseConfig,
+} from "./supabaseConfig.js";
+import { DULO_BASE, DULO_ORIGIN } from "./constants.js";
+const DEVICE_NAME = process.env.DULO_DEVICE_NAME || "Masqueradarr";
 
 // Default UA when a session carries no captured UA (paste/handoff). Kept reasonably current for coherence
 // with the server-side API calls; a per-session `userAgent` (loginBrowser capture) overrides this.
 export const UA =
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 const REFRESH_MARGIN_MS = 60_000; // refresh when <60s of access_token life remains
 const TRANSIENT_BACKOFF_MS = 60_000; // after a transient refresh failure, don't retry for this long
 
@@ -51,7 +56,7 @@ const TRANSIENT_BACKOFF_MS = 60_000; // after a transient refresh failure, don't
 const KEEPALIVE_LEAD_MS = Number(process.env.DULO_REFRESH_LEAD_MS || 300_000); // 5 min
 const KEEPALIVE_MIN_DELAY_MS = 5_000; // never arm closer than now+5s (past-due / clock-skew clamp)
 const KEEPALIVE_MAX_ARM_MS = 43_200_000; // re-check at least every 12h; also dodges Node's 2^31−1 setTimeout overflow (fires immediately)
-const tag = 'dulo:auth';
+const tag = "dulo:auth";
 
 export interface DuloStatus {
   signedIn: boolean;
@@ -88,39 +93,60 @@ export interface CapturePayload {
   userAgent?: string | null;
   // Where the session came from: 'streamed' (dedicated throwaway browser context — its own refresh-token
   // family), or 'paste' / 'handoff' (shares the user's own tab's family → rotation-collision risk).
-  origin?: 'streamed' | 'paste' | 'handoff' | null;
+  origin?: "streamed" | "paste" | "handoff" | null;
 }
 
-function browserHeaders(ua: string | null | undefined, extra: Record<string, string> = {}): Record<string, string> {
-  return { 'User-Agent': ua || UA, Origin: DULO_ORIGIN, Referer: `${DULO_ORIGIN}/live`, ...extra };
+function browserHeaders(
+  ua: string | null | undefined,
+  extra: Record<string, string> = {},
+): Record<string, string> {
+  return {
+    "User-Agent": ua || UA,
+    Origin: DULO_ORIGIN,
+    Referer: `${DULO_ORIGIN}/live`,
+    ...extra,
+  };
 }
 
-function decodeJwt(token: string): { exp?: number; iss?: string; ref?: string } {
+function decodeJwt(token: string): {
+  exp?: number;
+  iss?: string;
+  ref?: string;
+} {
   try {
-    const part = token.split('.')[1];
+    const part = token.split(".")[1];
     if (!part) return {};
-    const json = Buffer.from(part.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+    const json = Buffer.from(
+      part.replace(/-/g, "+").replace(/_/g, "/"),
+      "base64",
+    ).toString("utf8");
     const p = JSON.parse(json) as Record<string, unknown>;
     return {
-      exp: typeof p.exp === 'number' ? p.exp : undefined,
-      iss: typeof p.iss === 'string' ? p.iss : undefined,
-      ref: typeof p.ref === 'string' ? p.ref : undefined,
+      exp: typeof p.exp === "number" ? p.exp : undefined,
+      iss: typeof p.iss === "string" ? p.iss : undefined,
+      ref: typeof p.ref === "string" ? p.ref : undefined,
     };
   } catch {
     return {};
   }
 }
 
-function deriveSupabaseUrl(token: string, provided?: string | null): string | null {
-  if (provided) return provided.replace(/\/+$/, '');
+function deriveSupabaseUrl(
+  token: string,
+  provided?: string | null,
+): string | null {
+  if (provided) return provided.replace(/\/+$/, "");
   const { iss, ref } = decodeJwt(token);
-  if (iss) return iss.replace(/\/auth\/v1\/?$/, '');
+  if (iss) return iss.replace(/\/auth\/v1\/?$/, "");
   if (ref) return `https://${ref}.supabase.co`;
   return currentSupabaseUrl();
 }
 
 // Normalize an expiry that may arrive as seconds or ms (or be absent → read the JWT `exp`) into ms epoch.
-function expiryMs(provided: number | null | undefined, token: string): number | null {
+function expiryMs(
+  provided: number | null | undefined,
+  token: string,
+): number | null {
   let n = provided ?? undefined;
   if (n == null) n = decodeJwt(token).exp;
   if (n == null) return null;
@@ -143,14 +169,18 @@ class PlaylistAuthState {
 
   /** The owning Playlist's ObjectId hex (informational), or null if the playlist row isn't provisioned yet. */
   private async ownerObjectId(): Promise<string | null> {
-    const pl = await Playlist.findOne({ id: this.source }, { _id: 1 }).lean<{ _id: unknown }>();
+    const pl = await Playlist.findOne({ id: this.source }, { _id: 1 }).lean<{
+      _id: unknown;
+    }>();
     return pl?._id != null ? String(pl._id) : null;
   }
 
   /** Load the singleton row, creating a signed-out shell (with a fresh device fingerprint) if absent. */
   private async load(): Promise<PlaylistAuthDoc> {
     if (this.cache) return this.cache;
-    const existing = await PlaylistAuthModel.findById(this.source).lean<PlaylistAuthDoc>();
+    const existing = await PlaylistAuthModel.findById(
+      this.source,
+    ).lean<PlaylistAuthDoc>();
     if (existing) {
       this.cache = existing;
       return existing;
@@ -171,17 +201,23 @@ class PlaylistAuthState {
       userAgent: null,
       sharedFamily: false,
       refreshBackoffUntil: null,
-      status: 'signed_out',
+      status: "signed_out",
       blockReason: null,
       lastError: null,
       updatedAt: new Date().toISOString(),
     };
-    await PlaylistAuthModel.updateOne({ _id: this.source }, { $set: fresh }, { upsert: true });
+    await PlaylistAuthModel.updateOne(
+      { _id: this.source },
+      { $set: fresh },
+      { upsert: true },
+    );
     this.cache = fresh;
     return fresh;
   }
 
-  private async save(patch: Partial<PlaylistAuthDoc>): Promise<PlaylistAuthDoc> {
+  private async save(
+    patch: Partial<PlaylistAuthDoc>,
+  ): Promise<PlaylistAuthDoc> {
     const current = await this.load();
     // Keep playlist_id eventually-consistent: backfill it once the owning Playlist row exists.
     const playlist_id = current.playlist_id ?? (await this.ownerObjectId());
@@ -193,7 +229,11 @@ class PlaylistAuthState {
       updatedAt: new Date().toISOString(),
     };
     const { _id, ...rest } = next;
-    await PlaylistAuthModel.updateOne({ _id: this.source }, { $set: rest }, { upsert: true });
+    await PlaylistAuthModel.updateOne(
+      { _id: this.source },
+      { $set: rest },
+      { upsert: true },
+    );
     this.cache = next;
     // Cross-collection mirror (store + write-back): reflect the auth status onto the owning playlist's
     // `isAuthenticated` flag whenever status changes. The playlistauths doc stays the authority; this is a
@@ -202,7 +242,7 @@ class PlaylistAuthState {
     if (patch.status !== undefined) {
       await Playlist.updateOne(
         { source: this.source },
-        { $set: { isAuthenticated: patch.status === 'active' } },
+        { $set: { isAuthenticated: patch.status === "active" } },
       );
     }
     // The keepalive follows every state transition (all writes flow through save(), like the
@@ -214,8 +254,12 @@ class PlaylistAuthState {
 
   /** Store a captured Supabase session, then register the device. Returns the resulting status. */
   async signIn(payload: CapturePayload): Promise<DuloStatus> {
-    if (!payload || typeof payload.accessToken !== 'string' || !payload.accessToken) {
-      throw new Error('accessToken (string) required');
+    if (
+      !payload ||
+      typeof payload.accessToken !== "string" ||
+      !payload.accessToken
+    ) {
+      throw new Error("accessToken (string) required");
     }
     const patch: Partial<PlaylistAuthDoc> = {
       accessToken: payload.accessToken,
@@ -227,9 +271,9 @@ class PlaylistAuthState {
       userAgent: payload.userAgent ?? null,
       // paste/handoff sessions share the user's own tab's refresh-token family (rotation-collision risk);
       // a streamed-login session runs in a dedicated throwaway context with its own family.
-      sharedFamily: payload.origin === 'paste' || payload.origin === 'handoff',
+      sharedFamily: payload.origin === "paste" || payload.origin === "handoff",
       refreshBackoffUntil: null,
-      status: 'active',
+      status: "active",
       blockReason: null,
       lastError: null,
       // Default: clear the cached deviceId + bound flag so ensureDevice() re-activates under the new identity.
@@ -239,7 +283,8 @@ class PlaylistAuthState {
     // Prefer the device identity captured from dulo's own client (see CapturePayload). Reusing the real
     // fingerprint is the fix for `device_mismatch`; carrying the captured deviceId lets ensureDevice()
     // short-circuit so we don't disturb dulo's binding with a redundant server-side activation.
-    if (payload.deviceFingerprint) patch.deviceFingerprint = payload.deviceFingerprint;
+    if (payload.deviceFingerprint)
+      patch.deviceFingerprint = payload.deviceFingerprint;
     if (payload.deviceName) patch.deviceName = payload.deviceName;
     if (payload.deviceId) patch.deviceId = payload.deviceId;
     await this.save(patch);
@@ -247,7 +292,10 @@ class PlaylistAuthState {
       const token = await this.ensureFreshToken();
       await this.ensureDevice(token); // no-op when a captured deviceId was persisted above
     } catch (err) {
-      logger.warn(tag, `device activation after sign-in failed: ${(err as Error).message}`);
+      logger.warn(
+        tag,
+        `device activation after sign-in failed: ${(err as Error).message}`,
+      );
     }
     return this.status();
   }
@@ -261,7 +309,7 @@ class PlaylistAuthState {
       deviceBound: false,
       refreshBackoffUntil: null,
       sharedFamily: false,
-      status: 'signed_out',
+      status: "signed_out",
       blockReason: null,
       lastError: null,
     });
@@ -271,8 +319,10 @@ class PlaylistAuthState {
   /** Return a valid access_token, refreshing via Supabase when it is within the expiry margin. */
   async ensureFreshToken(): Promise<string> {
     const s = await this.load();
-    if (!s.accessToken) throw new Error('not authenticated — sign in to dulo first');
-    if (s.expiresAt == null || s.expiresAt - Date.now() > REFRESH_MARGIN_MS) return s.accessToken;
+    if (!s.accessToken)
+      throw new Error("not authenticated — sign in to dulo first");
+    if (s.expiresAt == null || s.expiresAt - Date.now() > REFRESH_MARGIN_MS)
+      return s.accessToken;
     // Within the refresh margin. If a recent refresh failed transiently AND the current token is still
     // technically valid, ride the existing token rather than hammering Supabase during the backoff window.
     if (
@@ -304,13 +354,20 @@ class PlaylistAuthState {
     const s = await this.load();
     const firstKey = currentAnonKey(s.anonKey);
     if (!s.refreshToken || !s.supabaseUrl) {
-      await this.save({ status: 'reauth_required', lastError: 'cannot refresh (missing refresh token / supabase url)' });
-      throw new Error('cannot refresh session — re-authenticate with dulo');
+      await this.save({
+        status: "reauth_required",
+        lastError: "cannot refresh (missing refresh token / supabase url)",
+      });
+      throw new Error("cannot refresh session — re-authenticate with dulo");
     }
     const post = (key: string) =>
       fetch(`${s.supabaseUrl}/auth/v1/token?grant_type=refresh_token`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', apikey: key, Authorization: `Bearer ${key}` },
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          apikey: key,
+          Authorization: `Bearer ${key}`,
+        },
         body: JSON.stringify({ refresh_token: s.refreshToken }),
       });
     // The anon key that will be persisted on success — corrected below if a rotated-key retry succeeds.
@@ -332,7 +389,10 @@ class PlaylistAuthState {
         // Tier A — the current best-known key (discovered cache / committed seed), no network.
         const known = currentAnonKey(); // ignores the stored snapshot
         if (!tried.has(known)) {
-          logger.warn(tag, 'refresh 401 at apikey gate — retrying with current known dulo Supabase key');
+          logger.warn(
+            tag,
+            "refresh 401 at apikey gate — retrying with current known dulo Supabase key",
+          );
           res = await post(known);
           tried.add(known);
           if (res.status !== 401) usedKey = known;
@@ -340,8 +400,15 @@ class PlaylistAuthState {
         // Tier B — live discovery, usable only for THIS session's project.
         if (res.status === 401) {
           const cfg = await discoverSupabaseConfig();
-          if (cfg && cfg.supabaseUrl === s.supabaseUrl && !tried.has(cfg.anonKey)) {
-            logger.warn(tag, 'refresh still 401 — retrying with freshly discovered dulo Supabase key');
+          if (
+            cfg &&
+            cfg.supabaseUrl === s.supabaseUrl &&
+            !tried.has(cfg.anonKey)
+          ) {
+            logger.warn(
+              tag,
+              "refresh still 401 — retrying with freshly discovered dulo Supabase key",
+            );
             res = await post(cfg.anonKey);
             if (res.status !== 401) usedKey = cfg.anonKey;
           }
@@ -353,7 +420,8 @@ class PlaylistAuthState {
         refreshBackoffUntil: Date.now() + TRANSIENT_BACKOFF_MS,
         lastError: `refresh network error (will retry): ${(err as Error).message}`,
       });
-      if (s.accessToken && (s.expiresAt == null || s.expiresAt > Date.now())) return s.accessToken;
+      if (s.accessToken && (s.expiresAt == null || s.expiresAt > Date.now()))
+        return s.accessToken;
       throw err;
     }
     if (res.status === 429 || res.status >= 500) {
@@ -362,15 +430,24 @@ class PlaylistAuthState {
         refreshBackoffUntil: Date.now() + TRANSIENT_BACKOFF_MS,
         lastError: `refresh transient HTTP ${res.status} (will retry)`,
       });
-      if (s.accessToken && (s.expiresAt == null || s.expiresAt > Date.now())) return s.accessToken;
-      throw new Error(`session refresh temporarily unavailable (HTTP ${res.status})`);
+      if (s.accessToken && (s.expiresAt == null || s.expiresAt > Date.now()))
+        return s.accessToken;
+      throw new Error(
+        `session refresh temporarily unavailable (HTTP ${res.status})`,
+      );
     }
     if (!res.ok) {
       // Permanent rejection (e.g. 400 invalid_grant / refresh_token_not_found / already-used) — the refresh
       // token is dead (often a rotation collision with the user's own dulo tab). Prompt a precise re-auth.
-      const body = (await res.text().catch(() => '')).slice(0, 200);
-      await this.save({ status: 'reauth_required', refreshBackoffUntil: null, lastError: `refresh rejected (HTTP ${res.status}): ${body || 'no body'}` });
-      throw new Error(`session refresh failed (HTTP ${res.status}) — re-authenticate`);
+      const body = (await res.text().catch(() => "")).slice(0, 200);
+      await this.save({
+        status: "reauth_required",
+        refreshBackoffUntil: null,
+        lastError: `refresh rejected (HTTP ${res.status}): ${body || "no body"}`,
+      });
+      throw new Error(
+        `session refresh failed (HTTP ${res.status}) — re-authenticate`,
+      );
     }
     const data = (await res.json().catch(() => ({}))) as {
       access_token?: string;
@@ -379,8 +456,12 @@ class PlaylistAuthState {
       expires_in?: number;
     };
     if (!data.access_token) {
-      await this.save({ status: 'reauth_required', refreshBackoffUntil: null, lastError: 'refresh returned no access_token' });
-      throw new Error('session refresh returned no token — re-authenticate');
+      await this.save({
+        status: "reauth_required",
+        refreshBackoffUntil: null,
+        lastError: "refresh returned no access_token",
+      });
+      throw new Error("session refresh returned no token — re-authenticate");
     }
     const expiresAt =
       data.expires_at != null
@@ -394,10 +475,15 @@ class PlaylistAuthState {
       expiresAt,
       anonKey: usedKey, // persists a rotated-key correction (a no-op when the stored key already worked)
       refreshBackoffUntil: null,
-      status: 'active',
+      status: "active",
       lastError: null,
     });
-    logger.ok(tag, usedKey !== firstKey ? 'refreshed access token (recovered rotated anon key)' : 'refreshed access token');
+    logger.ok(
+      tag,
+      usedKey !== firstKey
+        ? "refreshed access token (recovered rotated anon key)"
+        : "refreshed access token",
+    );
     return data.access_token;
   }
 
@@ -407,14 +493,20 @@ class PlaylistAuthState {
     if (s.deviceId) return s.deviceId;
     if (this.activating) {
       await this.activating;
-      return (await this.load()).deviceId ?? '';
+      return (await this.load()).deviceId ?? "";
     }
     this.activating = (async () => {
       const post = (token: string) =>
         fetch(`${DULO_BASE}/live-tv/activate-device`, {
-          method: 'POST',
-          headers: browserHeaders(s.userAgent, { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }),
-          body: JSON.stringify({ deviceFingerprint: s.deviceFingerprint, deviceName: s.deviceName || DEVICE_NAME }),
+          method: "POST",
+          headers: browserHeaders(s.userAgent, {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          }),
+          body: JSON.stringify({
+            deviceFingerprint: s.deviceFingerprint,
+            deviceName: s.deviceName || DEVICE_NAME,
+          }),
         });
       let res = await post(accessToken);
       if (res.status === 401) {
@@ -425,28 +517,37 @@ class PlaylistAuthState {
         if (fresh) res = await post(fresh);
       }
       if (res.status === 401) {
-        await this.save({ status: 'reauth_required', deviceBound: false, lastError: 'activate-device 401 (after forced token refresh)' });
-        throw new Error('device activation unauthorized — re-authenticate');
+        await this.save({
+          status: "reauth_required",
+          deviceBound: false,
+          lastError: "activate-device 401 (after forced token refresh)",
+        });
+        throw new Error("device activation unauthorized — re-authenticate");
       }
       if (!res.ok) {
         await this.save({ deviceBound: false });
         throw new Error(`activate-device failed (HTTP ${res.status})`);
       }
-      const data = (await res.json().catch(() => ({}))) as { device?: { id?: string; device_name?: string } };
+      const data = (await res.json().catch(() => ({}))) as {
+        device?: { id?: string; device_name?: string };
+      };
       // Phase-0 finding: a self-invented server-side fingerprint is accepted here (dulo enforces
       // single-active-device, not client attestation), so this reliably binds the account slot to us.
       await this.save({
         deviceId: data.device?.id ?? null,
         deviceName: data.device?.device_name ?? s.deviceName ?? DEVICE_NAME,
         deviceBound: true,
-        status: 'active',
+        status: "active",
       });
-      logger.ok(tag, `device activated (${data.device?.id ?? 'no id returned'})`);
+      logger.ok(
+        tag,
+        `device activated (${data.device?.id ?? "no id returned"})`,
+      );
     })().finally(() => {
       this.activating = null;
     });
     await this.activating;
-    return (await this.load()).deviceId ?? '';
+    return (await this.load()).deviceId ?? "";
   }
 
   /** Force a fresh device activation (drops the cached deviceId so ensureDevice re-registers our slot).
@@ -459,14 +560,22 @@ class PlaylistAuthState {
   }
 
   /** Resolve a fresh, expiring playback master URL for one channel. Throws (→ proxy 502) on failure. */
-  async resolvePlayback(channelId: string): Promise<{ playbackUrl: string; expiresAt: string | null }> {
+  async resolvePlayback(
+    channelId: string,
+  ): Promise<{ playbackUrl: string; expiresAt: string | null }> {
     const token = await this.ensureFreshToken();
     const s = await this.ensureDeviceLoaded(token);
     const post = (tok: string) =>
       fetch(`${DULO_BASE}/live-tv/playback-session`, {
-        method: 'POST',
-        headers: browserHeaders(s.userAgent, { 'Content-Type': 'application/json', Authorization: `Bearer ${tok}` }),
-        body: JSON.stringify({ deviceFingerprint: s.deviceFingerprint, channelId }),
+        method: "POST",
+        headers: browserHeaders(s.userAgent, {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${tok}`,
+        }),
+        body: JSON.stringify({
+          deviceFingerprint: s.deviceFingerprint,
+          channelId,
+        }),
       });
     let res = await post(token);
     if (res.status === 401) {
@@ -476,22 +585,40 @@ class PlaylistAuthState {
       if (fresh) res = await post(fresh);
     }
     if (res.status === 401) {
-      await this.save({ status: 'reauth_required', lastError: 'playback-session 401 (after forced token refresh)' });
-      throw new Error('playback unauthorized — re-authenticate with dulo');
+      await this.save({
+        status: "reauth_required",
+        lastError: "playback-session 401 (after forced token refresh)",
+      });
+      throw new Error("playback unauthorized — re-authenticate with dulo");
     }
     if (res.status === 403) {
-      const body = (await res.json().catch(() => ({}))) as { block?: { reason?: string }; error?: string; reason?: string };
-      const reason = body.block?.reason || body.error || body.reason || 'access blocked';
+      const body = (await res.json().catch(() => ({}))) as {
+        block?: { reason?: string };
+        error?: string;
+        reason?: string;
+      };
+      const reason =
+        body.block?.reason || body.error || body.reason || "access blocked";
       // `device_mismatch` here means another device evicted our Live-TV slot (dulo is single-active-device).
       // Flag the device unbound so the UI can offer a one-click "Re-activate device" to reclaim it.
       const evicted = /device_mismatch|device/i.test(reason);
-      await this.save({ status: 'blocked', blockReason: reason, ...(evicted ? { deviceBound: false } : {}) });
+      await this.save({
+        status: "blocked",
+        blockReason: reason,
+        ...(evicted ? { deviceBound: false } : {}),
+      });
       throw new Error(`playback blocked: ${reason}`);
     }
-    if (!res.ok) throw new Error(`playback-session failed (HTTP ${res.status})`);
-    const data = (await res.json().catch(() => ({}))) as { playbackUrl?: string; expiresAt?: string };
-    if (!data.playbackUrl) throw new Error('playback-session returned no playbackUrl');
-    if (s.status !== 'active' || s.blockReason) await this.save({ status: 'active', blockReason: null, lastError: null });
+    if (!res.ok)
+      throw new Error(`playback-session failed (HTTP ${res.status})`);
+    const data = (await res.json().catch(() => ({}))) as {
+      playbackUrl?: string;
+      expiresAt?: string;
+    };
+    if (!data.playbackUrl)
+      throw new Error("playback-session returned no playbackUrl");
+    if (s.status !== "active" || s.blockReason)
+      await this.save({ status: "active", blockReason: null, lastError: null });
     return { playbackUrl: data.playbackUrl, expiresAt: data.expiresAt ?? null };
   }
 
@@ -540,7 +667,7 @@ class PlaylistAuthState {
       tag,
       this.keepaliveNextAt
         ? `keepalive armed — next token refresh ${new Date(this.keepaliveNextAt).toISOString()}`
-        : 'keepalive idle (no refreshable session)',
+        : "keepalive idle (no refreshable session)",
     );
   }
 
@@ -558,7 +685,12 @@ class PlaylistAuthState {
     if (!this.keepaliveEnabled) return;
     void this.load()
       .then((s) => this.scheduleKeepalive(s))
-      .catch((err) => logger.warn(tag, `keepalive re-evaluate after invalidate failed: ${(err as Error).message}`));
+      .catch((err) =>
+        logger.warn(
+          tag,
+          `keepalive re-evaluate after invalidate failed: ${(err as Error).message}`,
+        ),
+      );
   }
 
   private disarmKeepalive(): void {
@@ -572,17 +704,27 @@ class PlaylistAuthState {
    *  just works). A transient-failure backoff wins over the lead: retry just after it lapses. */
   private scheduleKeepalive(s: PlaylistAuthDoc): void {
     if (!this.keepaliveEnabled) return;
-    if (!s.accessToken || !s.refreshToken || s.status === 'signed_out' || s.status === 'reauth_required' || s.expiresAt == null) {
+    if (
+      !s.accessToken ||
+      !s.refreshToken ||
+      s.status === "signed_out" ||
+      s.status === "reauth_required" ||
+      s.expiresAt == null
+    ) {
       this.disarmKeepalive();
       return;
     }
     let at = s.expiresAt - KEEPALIVE_LEAD_MS;
-    if (s.refreshBackoffUntil != null && s.refreshBackoffUntil > Date.now()) at = Math.max(at, s.refreshBackoffUntil + 1_000);
-    const delay = Math.min(Math.max(at - Date.now(), KEEPALIVE_MIN_DELAY_MS), KEEPALIVE_MAX_ARM_MS);
+    if (s.refreshBackoffUntil != null && s.refreshBackoffUntil > Date.now())
+      at = Math.max(at, s.refreshBackoffUntil + 1_000);
+    const delay = Math.min(
+      Math.max(at - Date.now(), KEEPALIVE_MIN_DELAY_MS),
+      KEEPALIVE_MAX_ARM_MS,
+    );
     this.disarmKeepalive();
     this.keepaliveNextAt = Date.now() + delay;
     const timer = setTimeout(() => void this.keepaliveTick(), delay);
-    if (typeof timer.unref === 'function') timer.unref(); // never keeps the process alive on its own
+    if (typeof timer.unref === "function") timer.unref(); // never keeps the process alive on its own
     this.keepaliveTimer = timer;
   }
 
@@ -591,8 +733,11 @@ class PlaylistAuthState {
   private armRetry(): void {
     if (!this.keepaliveEnabled || this.keepaliveTimer) return;
     this.keepaliveNextAt = Date.now() + TRANSIENT_BACKOFF_MS;
-    const timer = setTimeout(() => void this.keepaliveTick(), TRANSIENT_BACKOFF_MS);
-    if (typeof timer.unref === 'function') timer.unref();
+    const timer = setTimeout(
+      () => void this.keepaliveTick(),
+      TRANSIENT_BACKOFF_MS,
+    );
+    if (typeof timer.unref === "function") timer.unref();
     this.keepaliveTimer = timer;
   }
 
@@ -608,29 +753,38 @@ class PlaylistAuthState {
     } catch (err) {
       // Mongo blip before any decision could be made — nothing is armed and nothing was persisted, so
       // re-arm a bounded retry ourselves or the keepalive dies silently.
-      logger.warn(tag, `keepalive re-read failed (retrying in ${TRANSIENT_BACKOFF_MS / 1000}s): ${(err as Error).message}`);
+      logger.warn(
+        tag,
+        `keepalive re-read failed (retrying in ${TRANSIENT_BACKOFF_MS / 1000}s): ${(err as Error).message}`,
+      );
       this.armRetry();
       return;
     }
     if (!this.keepaliveEnabled) return;
-    if (!s.accessToken || !s.refreshToken || s.status === 'signed_out' || s.status === 'reauth_required') return;
+    if (
+      !s.accessToken ||
+      !s.refreshToken ||
+      s.status === "signed_out" ||
+      s.status === "reauth_required"
+    )
+      return;
     if (s.expiresAt == null || s.expiresAt - Date.now() > KEEPALIVE_LEAD_MS) {
       this.scheduleKeepalive(s); // woke early (12h recheck / a play-path refresh rotated meanwhile) — re-aim
       return;
     }
-    logger.info(tag, 'keepalive: refreshing access token ahead of expiry');
+    logger.info(tag, "keepalive: refreshing access token ahead of expiry");
     await this.runRefresh().catch((err) => {
       // refresh() persists its classification, and that save() re-armed (transient) or disarmed
       // (permanent) the timer. If NEITHER landed (e.g. the Mongo write inside refresh() failed), the
       // beat would end with a live session and no timer — defensively re-arm a bounded retry.
       logger.warn(tag, `keepalive refresh failed: ${(err as Error).message}`);
       const st = this.cache?.status;
-      if (st !== 'reauth_required' && st !== 'signed_out') this.armRetry();
+      if (st !== "reauth_required" && st !== "signed_out") this.armRetry();
     });
   }
 }
 
-export const duloAuth = new PlaylistAuthState('dulo');
+export const duloAuth = new PlaylistAuthState("dulo");
 
 // Boot/shutdown seam for index.ts (the repo's start*/stop* idiom — see logStore/streamTelemetry). The
 // keepalive lives on the instance (rotations must land in its cache via save()), so these just delegate
