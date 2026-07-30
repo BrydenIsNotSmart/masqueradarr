@@ -24,7 +24,7 @@ import type { SourceAdapter } from "../types.js";
 import type { SourceChannelDoc } from "../../models/SourceChannel.js";
 
 const SNAPSHOT = snapshotFile("dulo");
-import { DULO_ORIGIN, DULO_BASE } from "./dulo/constants.js";
+import { DULO_ORIGIN, DULO_API } from "./dulo/constants.js";
 const UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 const ENTRY_PREFIX = "dulo://channel/";
