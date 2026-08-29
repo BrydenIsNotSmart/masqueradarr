@@ -13,17 +13,25 @@
 // covers only the catalog manifest, per-source status/metrics, sync/reset, built-in provisioning, and dulo
 // auth. Mounted at the app root (app.use(sourcesRouter)) because its paths span /api/sources.
 
-import { Router } from 'express';
-import { logger } from '../sources/core/logger.js';
-import { SOURCES, getSource } from '../sources/registry.js';
-import { DEFAULT_BUILTIN_META } from '../sources/types.js';
-import { createMetrics, snapshotOne, type Metrics } from '../sources/core/metrics.js';
-import { syncLive, resetSource, ensureShellRow } from '../sources/seed.js';
-import { duloAuth } from '../sources/adapters/dulo/auth.js';
-import { duloPairing, buildBookmarklet, buildSnippet } from '../sources/adapters/dulo/pairing.js';
-import type { Request, Response } from 'express';
-import { Playlist } from '../models/Playlist.js';
-import { grantPlaylistToAdmins } from '../security/adminAccess.js';
+import { Router } from "express";
+import { logger } from "../sources/core/logger.js";
+import { SOURCES, getSource } from "../sources/registry.js";
+import { DEFAULT_BUILTIN_META } from "../sources/types.js";
+import {
+  createMetrics,
+  snapshotOne,
+  type Metrics,
+} from "../sources/core/metrics.js";
+import { syncLive, resetSource, ensureShellRow } from "../sources/seed.js";
+import { duloAuth } from "../sources/adapters/dulo/auth.js";
+import {
+  duloPairing,
+  buildBookmarklet,
+  buildSnippet,
+} from "../sources/adapters/dulo/pairing.js";
+import type { Request, Response } from "express";
+import { Playlist } from "../models/Playlist.js";
+import { grantPlaylistToAdmins } from "../security/adminAccess.js";
 
 export const sourcesRouter = Router();
 
@@ -37,7 +45,7 @@ for (const adapter of SOURCES) {
 // ── Manifest ────────────────────────────────────────────────────────────────
 // Synthetic (proxy-only) sources like `direct` are OMITTED — they have no catalog and are not syncable
 // playlists; the SPA must not list them as sources.
-sourcesRouter.get('/api/sources', (_req, res) => {
+sourcesRouter.get("/api/sources", (_req, res) => {
   res.json(
     SOURCES.filter((s) => !s.synthetic).map((s) => ({
       id: s.id,
@@ -59,10 +67,10 @@ sourcesRouter.get('/api/sources', (_req, res) => {
 });
 
 // ── Per-source runtime status (dlhd mirror provenance; null for sources without one) ──
-sourcesRouter.get('/api/sources/:id/status', async (req, res, next) => {
+sourcesRouter.get("/api/sources/:id/status", async (req, res, next) => {
   try {
     const adapter = getSource(req.params.id);
-    if (!adapter) return res.status(404).json({ error: 'unknown_source' });
+    if (!adapter) return res.status(404).json({ error: "unknown_source" });
     const status = adapter.status ? await adapter.status() : null;
     res.json(status ?? null);
   } catch (err) {
@@ -71,16 +79,17 @@ sourcesRouter.get('/api/sources/:id/status', async (req, res, next) => {
 });
 
 // ── Per-source proxy metrics ──────────────────────────────────────────────────
-sourcesRouter.get('/api/sources/:id/metrics', (req, res) => {
+sourcesRouter.get("/api/sources/:id/metrics", (req, res) => {
   const m = metricsById.get(req.params.id);
-  if (!m) return res.status(404).json({ error: 'unknown_source' });
+  if (!m) return res.status(404).json({ error: "unknown_source" });
   res.json(snapshotOne(m));
 });
 
 // ── Live sync (refresh channels + Playlist sync metadata from upstream) ───────
-sourcesRouter.post('/api/sources/:id/sync', async (req, res, next) => {
+sourcesRouter.post("/api/sources/:id/sync", async (req, res, next) => {
   try {
-    if (!getSource(req.params.id)) return res.status(404).json({ error: 'unknown_source' });
+    if (!getSource(req.params.id))
+      return res.status(404).json({ error: "unknown_source" });
     res.json(await syncLive(req.params.id));
   } catch (err) {
     next(err);
@@ -88,9 +97,10 @@ sourcesRouter.post('/api/sources/:id/sync', async (req, res, next) => {
 });
 
 // ── Reset (Restore defaults) = drop channels + re-sync from upstream ───────────
-sourcesRouter.post('/api/sources/:id/reset', async (req, res, next) => {
+sourcesRouter.post("/api/sources/:id/reset", async (req, res, next) => {
   try {
-    if (!getSource(req.params.id)) return res.status(404).json({ error: 'unknown_source' });
+    if (!getSource(req.params.id))
+      return res.status(404).json({ error: "unknown_source" });
     res.json(await resetSource(req.params.id));
   } catch (err) {
     next(err);
@@ -103,18 +113,22 @@ sourcesRouter.post('/api/sources/:id/reset', async (req, res, next) => {
 // re-adding an already-present built-in is a harmless no-op) WITHOUT syncing: channels still populate on the
 // user's first "Sync now" (POST /api/sources/:id/sync). A synthetic (proxy-only) source has no catalog and is
 // not a syncable playlist → treated as unknown. Admin-only (the /api/sources adminOnlyRoutes prefix).
-sourcesRouter.post('/api/sources/:id/provision', async (req, res, next) => {
+sourcesRouter.post("/api/sources/:id/provision", async (req, res, next) => {
   try {
     const adapter = getSource(req.params.id);
-    if (!adapter || adapter.synthetic) return res.status(404).json({ error: 'unknown_source' });
+    if (!adapter || adapter.synthetic)
+      return res.status(404).json({ error: "unknown_source" });
     await ensureShellRow(adapter);
     // Auto-grant the just-provisioned built-in to every admin (it hosts Global → allowedPlaylists). Best-
     // effort — a grant hiccup must not fail the provision (admins still pass the role bypass meanwhile).
-    await grantPlaylistToAdmins(adapter.id, 'global').catch((err) =>
-      logger.warn('users', `grantPlaylistToAdmins after provision (${adapter.id}) failed: ${(err as Error).message}`),
+    await grantPlaylistToAdmins(adapter.id, "global").catch((err) =>
+      logger.warn(
+        "users",
+        `grantPlaylistToAdmins after provision (${adapter.id}) failed: ${(err as Error).message}`,
+      ),
     );
     const doc = await Playlist.findOne({ id: adapter.id }, { _id: 0 }).lean();
-    if (!doc) return res.status(500).json({ error: 'provision_failed' });
+    if (!doc) return res.status(500).json({ error: "provision_failed" });
     res.status(201).json({ ...doc, channels: 0 });
   } catch (err) {
     next(err);
@@ -125,12 +139,21 @@ sourcesRouter.post('/api/sources/:id/provision', async (req, res, next) => {
 // dulo gates Live TV streams behind a Supabase session (no static stream URLs). The SPA captures the
 // already signed-in session from dulo.tv and POSTs the tokens here — only tokens are stored, never a
 // password (see sources/adapters/dulo/auth.ts). Read auth state via GET /api/sources/dulo/status.
-sourcesRouter.post('/api/sources/dulo/auth', async (req, res, next) => {
+sourcesRouter.post("/api/sources/dulo/auth", async (req, res, next) => {
   try {
-    const { accessToken, refreshToken, expiresAt, supabaseUrl, anonKey, deviceFingerprint, deviceId, deviceName, userAgent } =
-      req.body ?? {};
-    if (typeof accessToken !== 'string' || !accessToken) {
-      return res.status(400).json({ error: 'accessToken (string) required' });
+    const {
+      accessToken,
+      refreshToken,
+      expiresAt,
+      supabaseUrl,
+      anonKey,
+      deviceFingerprint,
+      deviceId,
+      deviceName,
+      userAgent,
+    } = req.body ?? {};
+    if (typeof accessToken !== "string" || !accessToken) {
+      return res.status(400).json({ error: "accessToken (string) required" });
     }
     // Device identity is optional here (dulo enforces single-active-device, not client attestation, so the
     // server re-activates its own fingerprint — see auth.ts). Record the capturing browser's UA (from the
@@ -145,8 +168,11 @@ sourcesRouter.post('/api/sources/dulo/auth', async (req, res, next) => {
       deviceFingerprint,
       deviceId,
       deviceName,
-      userAgent: (typeof userAgent === 'string' && userAgent) || req.get('user-agent') || null,
-      origin: 'paste',
+      userAgent:
+        (typeof userAgent === "string" && userAgent) ||
+        req.get("user-agent") ||
+        null,
+      origin: "paste",
     });
     res.status(201).json(status);
   } catch (err) {
@@ -156,31 +182,40 @@ sourcesRouter.post('/api/sources/dulo/auth', async (req, res, next) => {
 
 // Reclaim dulo's single Live-TV device slot without a full re-sign-in (recovers a `device_mismatch` after
 // another device evicted us). Admin-only via the /api/sources prefix.
-sourcesRouter.post('/api/sources/dulo/reactivate-device', async (_req, res, next) => {
-  try {
-    res.json(await duloAuth.reactivateDevice());
-  } catch (err) {
-    next(err);
-  }
-});
+sourcesRouter.post(
+  "/api/sources/dulo/reactivate-device",
+  async (_req, res, next) => {
+    try {
+      res.json(await duloAuth.reactivateDevice());
+    } catch (err) {
+      next(err);
+    }
+  },
+);
 
 // ── dulo browser-handoff pairing (the durable Google/social path) ─────────────
 // Social IdPs block sign-in inside any automated/embedded browser, so the user signs in with their OWN real
 // browser and a one-click bookmarklet POSTs the captured session back to the code-gated callback below.
 // Admin-only (the /api/sources prefix) — mints the pairing artifacts for the SPA to render.
-sourcesRouter.post('/api/sources/dulo/auth/pair', (req, res) => {
+sourcesRouter.post("/api/sources/dulo/auth/pair", (req, res) => {
   const { code, expiresAt } = duloPairing.mint();
   // The URL the admin's browser is currently using to reach masqueradarr === where the bookmarklet must POST
   // (same browser runs both). Honor reverse-proxy forwarding headers so an https front door isn't mislabeled.
-  const proto = (req.headers['x-forwarded-proto'] as string | undefined)?.split(',')[0]?.trim() || req.protocol;
-  const host = (req.headers['x-forwarded-host'] as string | undefined) || req.get('host') || '';
+  const proto =
+    (req.headers["x-forwarded-proto"] as string | undefined)
+      ?.split(",")[0]
+      ?.trim() || req.protocol;
+  const host =
+    (req.headers["x-forwarded-host"] as string | undefined) ||
+    req.get("host") ||
+    "";
   const base = `${proto}://${host}`;
   const callbackUrl = `${base}/api/dulo/callback`;
   res.json({
     code,
     expiresAt,
     callbackUrl,
-    duloUrl: 'https://dulo.tv',
+    duloUrl: "https://dulo.gd",
     bookmarklet: buildBookmarklet(code, callbackUrl),
     snippet: buildSnippet(code, callbackUrl),
   });
@@ -189,30 +224,33 @@ sourcesRouter.post('/api/sources/dulo/auth/pair', (req, res) => {
 // Cross-origin CORS for the callback: the bookmarklet runs on dulo.tv and POSTs here. No cookies/credentials
 // are used (the pairing code is the bearer), so echoing the Origin is safe.
 function setPairCors(req: Request, res: Response): void {
-  res.setHeader('Access-Control-Allow-Origin', (req.headers.origin as string) || '*');
-  res.setHeader('Vary', 'Origin');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  res.setHeader('Access-Control-Max-Age', '600');
+  res.setHeader(
+    "Access-Control-Allow-Origin",
+    (req.headers.origin as string) || "*",
+  );
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Max-Age", "600");
 }
 
 // The pairing CALLBACK. Deliberately NOT under /api/sources → it escapes the admin gate (an anonymous user's
 // own browser must reach it); it is gated instead by the single-use, short-TTL pairing code. `authenticate`
 // still runs (non-blocking) but the bookmarklet sends no token, so req.user stays undefined — fine.
-sourcesRouter.options('/api/dulo/callback', (req, res) => {
+sourcesRouter.options("/api/dulo/callback", (req, res) => {
   setPairCors(req, res);
   res.status(204).end();
 });
-sourcesRouter.post('/api/dulo/callback', async (req, res, next) => {
+sourcesRouter.post("/api/dulo/callback", async (req, res, next) => {
   setPairCors(req, res);
   try {
     const body = (req.body ?? {}) as Record<string, unknown>;
-    const code = typeof body.code === 'string' ? body.code : '';
+    const code = typeof body.code === "string" ? body.code : "";
     if (!duloPairing.consume(code)) {
-      return res.status(403).json({ error: 'invalid_or_expired_pairing_code' });
+      return res.status(403).json({ error: "invalid_or_expired_pairing_code" });
     }
-    if (typeof body.accessToken !== 'string' || !body.accessToken) {
-      return res.status(400).json({ error: 'accessToken (string) required' });
+    if (typeof body.accessToken !== "string" || !body.accessToken) {
+      return res.status(400).json({ error: "accessToken (string) required" });
     }
     const status = await duloAuth.signIn({
       accessToken: body.accessToken,
@@ -223,8 +261,8 @@ sourcesRouter.post('/api/dulo/callback', async (req, res, next) => {
       deviceFingerprint: (body.deviceFingerprint as string | null) ?? null,
       deviceId: (body.deviceId as string | null) ?? null,
       deviceName: (body.deviceName as string | null) ?? null,
-      userAgent: typeof body.userAgent === 'string' ? body.userAgent : null,
-      origin: 'handoff',
+      userAgent: typeof body.userAgent === "string" ? body.userAgent : null,
+      origin: "handoff",
     });
     res.status(201).json({ ok: true, status });
   } catch (err) {
@@ -232,7 +270,7 @@ sourcesRouter.post('/api/dulo/callback', async (req, res, next) => {
   }
 });
 
-sourcesRouter.delete('/api/sources/dulo/auth', async (_req, res, next) => {
+sourcesRouter.delete("/api/sources/dulo/auth", async (_req, res, next) => {
   try {
     await duloAuth.signOut();
     res.status(204).end();

@@ -11,7 +11,7 @@
 // instance within its short window, once. The callback route itself is unauthenticated (escapes the admin
 // gate) precisely so the user's own browser can reach it; the code is the bearer.
 
-import { randomBytes } from 'node:crypto';
+import { randomBytes } from "node:crypto";
 
 const CODE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 const codes = new Map<string, number>(); // code → expiresAt (ms epoch)
@@ -25,7 +25,7 @@ export const duloPairing = {
   mint(): { code: string; expiresAt: number } {
     const now = Date.now();
     sweep(now);
-    const code = randomBytes(24).toString('base64url'); // 32 url-safe chars, ~192 bits
+    const code = randomBytes(24).toString("base64url"); // 32 url-safe chars, ~192 bits
     const expiresAt = now + CODE_TTL_MS;
     codes.set(code, expiresAt);
     return { code, expiresAt };
@@ -70,7 +70,7 @@ function harvesterBody(code: string, callbackUrl: string): string {
 
 /** A draggable `javascript:` bookmarklet (drag to the bookmarks bar, click on dulo.tv). */
 export function buildBookmarklet(code: string, callbackUrl: string): string {
-  return 'javascript:' + encodeURIComponent(harvesterBody(code, callbackUrl));
+  return "javascript:" + encodeURIComponent(harvesterBody(code, callbackUrl));
 }
 
 /** The same harvester as a raw snippet to paste into the browser DevTools console. */

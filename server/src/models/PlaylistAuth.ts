@@ -1,4 +1,4 @@
-import { Schema, model } from 'mongoose';
+import { Schema, model } from "mongoose";
 
 // PlaylistAuth (playlistauths) — the per-playlist authenticated-session store. One row per playlist that
 // requires authentication to stream; the row traces back to its owning playlist via `playlistSource`.
@@ -54,7 +54,7 @@ const PlaylistAuthSchema = new Schema<PlaylistAuthDoc>(
     userAgent: { type: String, default: null },
     sharedFamily: { type: Boolean, default: false },
     refreshBackoffUntil: { type: Number, default: null },
-    status: { type: String, required: true, default: 'signed_out' },
+    status: { type: String, required: true, default: "signed_out" },
     blockReason: { type: String, default: null },
     lastError: { type: String, default: null },
     updatedAt: { type: String, required: true },
@@ -65,4 +65,7 @@ const PlaylistAuthSchema = new Schema<PlaylistAuthDoc>(
 // One auth doc per playlist source — enforces the 1:1 playlist↔auth relationship and serves lookup by owner.
 PlaylistAuthSchema.index({ playlistSource: 1 }, { unique: true });
 
-export const PlaylistAuth = model<PlaylistAuthDoc>('PlaylistAuth', PlaylistAuthSchema);
+export const PlaylistAuth = model<PlaylistAuthDoc>(
+  "PlaylistAuth",
+  PlaylistAuthSchema,
+);

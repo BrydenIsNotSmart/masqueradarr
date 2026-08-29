@@ -243,7 +243,7 @@ creating the **first admin account**. After that:
    runtime**, so when dulo migrates its Supabase project (rotating the public URL + anon key) the session
    self-heals on its next refresh with no re-capture and nothing to configure. If you captured the session
    from your own browser (pair/paste), just **close that dulo tab — don't sign out**: signing out of
-   dulo.tv revokes the very session you handed over.
+   dulo.gd revokes the very session you handed over.
 3. **Sync now** to populate channels, then optionally add **EPG Sources** and link guide data on the
    **Channel Mapping** screen.
 4. Create **Users** with per-user access lists — each gets a personal **tokenized `.m3u` + XMLTV guide
@@ -475,8 +475,8 @@ All adapters implement the `SourceAdapter` contract (`server/src/sources/types.t
 | `direct` | Imported | — | Identity (passthrough) | — | — |
 | `hdhomerun` | HDHomeRun | — | Catalog import (playback dormant — needs remux) | — | — |
 | `local` | Local Now | — | Sentinel → rotating CDN | — | — |
-| `dulo` | dulo.tv | session | `dulo://` sentinel → playbackUrl | — | yes |
-| `dlhd` | DaddyLive | — | `watch.php` → 3-hop scrape, 6 providers | yes | yes |
+| `dulo` | dulo.gd | session | `dulo://` sentinel → playbackUrl | — | yes |
+| `dlhd` | DaddyLive | — | `watch.php` → 3-hop scrape | yes | yes |
 | `tubi` | Tubi.TV | — | `tubi://` → Tubi API | yes (inline) | — |
 | `xumo` | Xumo Play | — | broadcast.json → 3-hop API | yes | — |
 | `stirr` | STIRR | — | `/playable` → 1-hop POST | yes | — |

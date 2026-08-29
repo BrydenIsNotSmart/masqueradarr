@@ -3,7 +3,7 @@
 // playlist) consumes any adapter without per-source branching. Adding a source = one adapter +
 // one registry line.
 
-import type { SourceChannelDoc } from '../models/SourceChannel.js';
+import type { SourceChannelDoc } from "../models/SourceChannel.js";
 
 export interface SourceMeta {
   live?: boolean;
@@ -16,7 +16,7 @@ export interface RawListing {
   meta?: SourceMeta;
 }
 
-export type ArtifactType = 'master' | 'variant' | 'segment' | 'other';
+export type ArtifactType = "master" | "variant" | "segment" | "other";
 
 export interface SourceGrouping {
   by: string;
@@ -81,7 +81,11 @@ export interface SourceProxy {
   /** Per-rewritten-child hook (dlhd: dynamic-allow each host; dulo/common: null). */
   onPlaylistChildHost: ((host: string) => void) | null;
   /** dulo/common: pass-through; dlhd: relabel disguised image/pdf TS as video/mp2t. */
-  relabelSegmentContentType(url: string, contentType: string, type?: ArtifactType): string;
+  relabelSegmentContentType(
+    url: string,
+    contentType: string,
+    type?: ArtifactType,
+  ): string;
   classifyArtifact(url: string): ArtifactType;
 }
 
@@ -167,7 +171,7 @@ export interface SourceAdapter {
   resolveStream(
     entryUrl: string,
     opts?: ResolveStreamOptions,
-  ): Promise<{ masterUrl: string; playerIndex?: number; playerCount?: number }>;
+  ): Promise<{ masterUrl: string }>;
   proxy: SourceProxy;
   /**
    * Optional post-sync side-effect, called by syncLive AFTER both channel stores are upserted/pruned.
@@ -177,7 +181,11 @@ export interface SourceAdapter {
    * upstream listing buildSource consumed (so the hook needn't re-hit a rate-limited upstream); `live` is
    * false on a snapshot fallback. Non-fatal: a throw here is logged and must not fail the channel sync.
    */
-  afterSync?(ctx: { raw: any[]; live: boolean; sourceId: string }): Promise<void>;
+  afterSync?(ctx: {
+    raw: any[];
+    live: boolean;
+    sourceId: string;
+  }): Promise<void>;
   /**
    * Optional SNAPSHOT-only transform, applied by scripts/rebuild-source-seed.ts to the live `raw` listing
    * BEFORE it is written to <id>.snapshot.json — NEVER on the sync path. The extension point for a source
