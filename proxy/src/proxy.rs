@@ -24,6 +24,7 @@ use crate::log;
 use crate::manifest::{enc, rewrite_manifest, RewriteResult};
 use crate::state::{AppState, ResolveErr, SourcePolicy, MAX_FAILOVER_ATTEMPTS};
 use crate::stream::{segment_body, TelemetryCtx};
+use crate::sync::RwExt;
 
 // RSL-3 upstream retry. A transient failure (transport error, or a 502/503/504 gateway status) is retried with
 // bounded backoff before the request is failed; a definitive response (2xx, 4xx, or a non-gateway 5xx) is used
@@ -101,6 +102,37 @@ pub async fn serve_stream(
     };
     if source.is_empty() {
         return text(400, "bad request: missing source");
+    }
+    // S3/ORIGIN segment: `<source>/o/<enc-entry>/<generation>-<seq>.ts`. Handled BEFORE everything below
+    // because it is answered entirely from the ring — no resolve, no upstream fetch, no Node round-trip.
+    // (That also means it must never reach buildGrant's stored-entry gate, which would reject it as an
+    // `unrecognized_entry` — a ring segment is not a channel's streamEntryUrl.)
+    if let Some(("o", tail)) = rest.split_once('/') {
+        let (enc_entry, file) = match tail.rsplit_once('/') {
+            Some(p) => p,
+            None => return text(400, "bad request: malformed origin segment path"),
+        };
+        let entry = match dec(enc_entry) {
+            Some(s) => s,
+            None => return text(400, "bad request: malformed encoded url"),
+        };
+        let rid = log::rid(source, &entry);
+        // A DEMUXED origin also publishes its two authored media playlists here, for the same reason its
+        // segments live here: answered from the ring, and never seen by buildGrant's stored-entry gate.
+        // The bytes are still RAM-only — the policy comes from the cache — but unlike `o/` segments this
+        // SUBSCRIBES, so a poll that finds no live ingest restarts one (which does resolve). That is what
+        // lets a demuxed session survive an ingest death: its client fetched the master once and has no
+        // other subscribing endpoint to poll.
+        let lane = match file {
+            "v.m3u8" => Some(crate::origin::Lane::Video),
+            "a.m3u8" => Some(crate::origin::Lane::Audio),
+            _ => None,
+        };
+        if let Some(lane) = lane {
+            let (token, pl, _) = parse_query(query);
+            return crate::origin::serve_playlist(&state, mount_path, source, &entry, lane, token.as_deref(), pl.as_deref(), &id, &rid).await;
+        }
+        return crate::origin::serve_segment(&state, source, &entry, file, &id, &rid).await;
     }
     // HOP if the segment after the source is the `h/` marker; else ENTRY.
     let (is_hop, encoded) = match rest.split_once('/') {
@@ -234,9 +266,67 @@ pub async fn serve_stream(
         }
     };
 
-    // SSRF gate on direct hops only (the entry's target is trusted resolve output).
-    if is_hop && !ssrf_ok(&policy, &fetch_url) {
-        log::warn("proxy", &rid, || format!("SSRF reject: {} not in the source allowlist", host_of(&fetch_url)));
+    // S3/ORIGIN — the ENTRY is answered from OUR ring, not by proxying the upstream manifest. Dispatched here,
+    // AFTER the resolve (which the ingest needs anyway and which is target-cached) but BEFORE the upstream
+    // fetch below: an origin entry must not fetch upstream at all, or every client poll would re-hit the
+    // provider and defeat the whole point of ingesting once.
+    //
+    // BOTH output shapes are rendered from the SAME ring — that is what makes `outputFormat` a rendering
+    // choice rather than a second pipeline. Raw TS stays external-mount-only (an in-app player is always HLS),
+    // exactly as on the passthrough path.
+    //
+    // Either renderer may DECLINE (`None`) when the upstream's shape cannot be ringed — fMP4, undecryptable
+    // segments, or audio carried in a separate #EXT-X-MEDIA rendition that the ring has no muxer to fold in.
+    // Falling through to the ordinary rewrite below is then the correct answer, not an error: that path
+    // passes renditions through for the player to fetch, so the channel plays WITH sound where the ring could
+    // only have served it silent. (Before this seam a decline meant an empty ring, a `READY_TIMEOUT` wait and
+    // a 503 — a dead channel.)
+    if !is_hop && policy.origin_enabled.load(Ordering::Relaxed) {
+        let want_ts = policy.output_format.read_ok().as_str() == "ts" && mount_path == "/api/ext/v1";
+        let ident = Identity { ip: ip.clone(), ua: ua.clone(), username: username.clone() };
+        if want_ts {
+            log::info("proxy", &rid, || "originEnabled + outputFormat=ts — serving raw TS from the ring".to_string());
+            if let Some(r) = crate::origin::serve_ts(&state, &policy, source, &stream_entry, pl.as_deref(), &ident, &rid).await {
+                return r;
+            }
+        } else {
+            log::info("proxy", &rid, || "originEnabled — serving the authored manifest from the ring".to_string());
+            if let Some(r) = crate::origin::serve_entry(
+                &state,
+                &policy,
+                mount_path,
+                source,
+                &stream_entry,
+                token.as_deref(),
+                pl.as_deref(),
+                &ident,
+                &rid,
+            )
+            .await
+            {
+                return r;
+            }
+        }
+    }
+
+    // SSRF gate. A HOP is a client-supplied child URL, so it must be IN the observational allowlist. An ENTRY
+    // target is resolve output that seeds that allowlist, so membership is meaningless there — but it still
+    // gets the scheme + private-host half, because an identity-resolve adapter passes the request URL through
+    // verbatim and Node's `unrecognized_entry` gate is a stored-channel check, not an address check. Defense in
+    // depth: a channel stored (or drifted) with a loopback/metadata/LAN target must not be fetched.
+    let allowed = if is_hop {
+        ssrf_ok(&policy, &fetch_url)
+    } else {
+        ssrf_public_ok(&policy, &fetch_url)
+    };
+    if !allowed {
+        log::warn("proxy", &rid, || {
+            format!(
+                "SSRF reject ({}): {} not permitted",
+                if is_hop { "hop/allowlist" } else { "entry/private" },
+                host_of(&fetch_url)
+            )
+        });
         return text(400, "bad request: upstream host not allowed");
     }
 
@@ -276,7 +366,7 @@ pub async fn serve_stream(
     //    entry / cold hop rides the live mirror — and a failover-pinned stream never snaps back to its dead
     //    parent) and fail this request (the player refetches).
     //  · ENTRY — a transport failure always enters the walk: a fresh resolve of the SAME pinned candidate
-    //    first (Node re-runs resolveStream → dlhd/dami reprobeMirror — the pre-failover mirror rotation),
+    //    first (Node re-runs resolveStream → dlhd reprobeMirror — the pre-failover mirror rotation),
     //    then, when failoverEnabled, the NEXT candidates in Node's order. A DEFINITIVE non-2xx enters the
     //    walk only when failoverOnDefiniteError is on (default keeps the forward-verbatim semantics).
     if resp.is_none() && is_hop {
@@ -411,12 +501,16 @@ pub async fn serve_stream(
             return raw(200, "application/octet-stream", raw_body.to_vec());
         }
         let text_body = String::from_utf8_lossy(&raw_body).into_owned();
+        // (S3 Phase 3 retired the ingest-warming hook that used to sit here.) With origin enabled BOTH output
+        // shapes normally return from the ring above — including a demuxed source's raw TS, which RMX now
+        // weaves rather than declining. What still reaches here is the `Ready::Ineligible` fallback: a shape
+        // the ring cannot hold at all (fMP4, `SAMPLE-AES`), where the rewrite below is the correct answer.
         // DST: continuous raw-TS output on the external mount when the (Default)/(Custom) proxyconfig selects
         // outputFormat 'ts' AND the upstream is pure MPEG-TS. Only on the ENTRY (the client then holds ONE TS
         // socket and issues no HOP polls). Not eligible (fMP4 / AES / no reachable variant) → fall through to
         // the HLS rewrite below (text_body + final_url are cloned so the fallback still owns them).
         log::trace("proxy", &rid, || format!("manifest received ({} bytes) from {}", text_body.len(), host_of(final_url.as_str())));
-        if !is_hop && mount_path == "/api/ext/v1" && policy.output_format.read().unwrap().as_str() == "ts" {
+        if !is_hop && mount_path == "/api/ext/v1" && policy.output_format.read_ok().as_str() == "ts" {
             log::info("proxy", &rid, || "outputFormat=ts — handing off to the raw-TS producer".to_string());
             let ts_ctx = crate::tsmux::TsContext {
                 state: state.clone(),
@@ -460,7 +554,7 @@ pub async fn serve_stream(
         // Grow the source's SSRF allowlist with every host referenced in the manifest (dynamic-allow).
         let grown = hosts.len();
         if !hosts.is_empty() {
-            let mut set = policy.hosts.write().unwrap();
+            let mut set = policy.hosts.write_ok();
             for h in hosts {
                 set.insert(h);
             }
@@ -478,10 +572,25 @@ pub async fn serve_stream(
                     media.container.as_deref().unwrap_or("-"),
                 )
             });
+            // The upstream's SHAPE, but ONLY on the entry poll. This branch serves the entry AND every child
+            // hop, and a hop's body is by definition the variant/media playlist — so an ungated shape would
+            // report `hls-master` once and then be overwritten with `hls-media` on the very next child poll
+            // and stay wrong for the life of the channel (noteMedia merges on non-null, and this producer
+            // sends no `replace` flag). The failure is silent and permanent, so the gate is the feature.
+            let body_is_master = crate::tsmux::is_master(&text_body);
+            let shape = if is_hop { None } else { Some(if body_is_master { "hls-master" } else { "hls-media" }) };
+            // ENCRYPTION is gated on the exact INVERSE condition to shape, and the asymmetry is the point:
+            // shape is a property of the ENTRY, while `#EXT-X-KEY` only ever appears in a MEDIA playlist. Ask
+            // a master and it answers "NONE" for every AES channel sitting behind one. So on a master-entry
+            // channel the encryption answer legitimately arrives on a later HOP poll — which works because
+            // noteMedia merges on non-null, leaving the null we send for the master alone.
+            let encryption = if body_is_master { None } else { Some(crate::tsmux::encryption_method(&text_body)) };
             state.report(serde_json::json!({
                 "kind": "media", "source": source, "entryUrl": stream_entry.as_str(),
                 "resolution": media.resolution, "codecs": media.codecs,
                 "frameRate": media.frame_rate, "container": media.container, "bandwidth": media.bandwidth,
+                "upstreamShape": shape,
+                "encryption": encryption,
             }));
         }
         // Telemetry: a served manifest poll is the viewer heartbeat (also carries the manifest byte count) AND
@@ -601,7 +710,7 @@ pub(crate) async fn failover_walk(
         tried += 1;
         // Level-3 lineage: one line per hop of the walk (attempt cursor + how many we've tried this walk).
         log::trace("failover", rid, || format!("attempt {attempt} (tried {tried}/{MAX_FAILOVER_ATTEMPTS})"));
-        match state.resolve_at(source, stream_entry, pl, attempt).await {
+        match state.resolve_at(source, stream_entry, pl, attempt, None).await {
             Ok((p, target)) => {
                 // The grant carries the authoritative failoverEnabled — a cold pre-walk policy cache may
                 // have defaulted it on. Never SERVE a child the operator disabled failover to; a disabled
@@ -782,7 +891,16 @@ pub(crate) fn is_private_host(host: &str) -> bool {
     false
 }
 
-fn ssrf_ok(policy: &SourcePolicy, url: &str) -> bool {
+/// The SCHEME + PRIVATE-HOST half of the SSRF gate, WITHOUT the allowlist-membership check.
+///
+/// This is the right gate for the ENTRY target, which is resolve output rather than a client-supplied child:
+/// the entry's host is what *seeds* `policy.hosts` (state.rs, on every resolve), so testing it for membership
+/// would either be vacuously true or reject the first request of every stream. What it must still not be is a
+/// loopback/link-local/RFC1918 address — an adapter whose `resolveStream` is identity (direct, and any source
+/// whose `isEntryUrl` returns false) passes the request URL through verbatim, so without this a stored entry
+/// pointing at 169.254.169.254 or a LAN host would be fetched. `allowPrivate` (grant-carried, per adapter)
+/// deliberately re-opens that for genuine LAN sources.
+fn ssrf_public_ok(policy: &SourcePolicy, url: &str) -> bool {
     let u = match Url::parse(url) {
         Ok(u) => u,
         Err(_) => return false,
@@ -794,16 +912,24 @@ fn ssrf_ok(policy: &SourcePolicy, url: &str) -> bool {
         Some(h) => h.to_lowercase(),
         None => return false,
     };
-    if !policy.allow_private.load(Ordering::Relaxed) && is_private_host(&host) {
+    policy.allow_private.load(Ordering::Relaxed) || !is_private_host(&host)
+}
+
+fn ssrf_ok(policy: &SourcePolicy, url: &str) -> bool {
+    if !ssrf_public_ok(policy, url) {
         return false;
     }
-    policy.hosts.read().unwrap().contains(&host)
+    let host = match Url::parse(url).ok().and_then(|u| u.host_str().map(|h| h.to_lowercase())) {
+        Some(h) => h,
+        None => return false,
+    };
+    policy.hosts.read_ok().contains(&host)
 }
 
 pub(crate) fn build_headers(policy: &SourcePolicy) -> reqwest::header::HeaderMap {
     use reqwest::header::{HeaderMap as RHeaderMap, HeaderName, HeaderValue};
     let mut hm = RHeaderMap::new();
-    let snapshot: Vec<(String, String)> = policy.headers.read().unwrap().clone();
+    let snapshot: Vec<(String, String)> = policy.headers.read_ok().clone();
     for (k, v) in snapshot {
         if let (Ok(name), Ok(val)) = (
             HeaderName::from_bytes(k.as_bytes()),
@@ -891,7 +1017,7 @@ pub(crate) fn text(code: u16, msg: &str) -> Response {
         .unwrap()
 }
 
-fn raw(code: u16, ct: &str, bytes: Vec<u8>) -> Response {
+pub(crate) fn raw(code: u16, ct: &str, bytes: Vec<u8>) -> Response {
     Response::builder()
         .status(StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY))
         .header("content-type", ct)

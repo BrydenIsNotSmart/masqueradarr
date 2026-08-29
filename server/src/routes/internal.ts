@@ -34,7 +34,7 @@ internalRouter.use((req, res, next) => {
 
 internalRouter.post('/resolve', async (req, res, next) => {
   try {
-    const { source, url, pl, attempt } = req.body ?? {};
+    const { source, url, pl, attempt, reason } = req.body ?? {};
     if (typeof source !== 'string' || !source || typeof url !== 'string' || !url) {
       res.status(400).json({ error: 'source_and_url_required' });
       return;
@@ -43,7 +43,10 @@ internalRouter.post('/resolve', async (req, res, next) => {
     // Older sidecars omit it → undefined (identical to today; also keeps probe-style callers inert).
     const att =
       typeof attempt === 'number' && Number.isInteger(attempt) && attempt >= 0 ? attempt : undefined;
-    const grant = await buildGrant(source, url, typeof pl === 'string' ? pl : undefined, att);
+    // `reason` (optional): why the data plane is retiring the upstream it was serving. Bounded and
+    // string-checked here rather than trusted — it reaches an adapter's memory and a log line.
+    const why = typeof reason === 'string' && reason ? reason.slice(0, 64) : undefined;
+    const grant = await buildGrant(source, url, typeof pl === 'string' ? pl : undefined, att, why);
     if (!grant.ok) {
       res.status(grant.status).json({ error: grant.error });
       return;
@@ -63,13 +66,15 @@ internalRouter.post('/resolve', async (req, res, next) => {
 // returns the resolved username so Rust can attribute telemetry (it has no relay-set x-masq-username at the edge).
 internalRouter.post('/authorize', async (req, res, next) => {
   try {
-    const { token, source } = req.body ?? {};
+    const { token, source, pl } = req.body ?? {};
     if (typeof source !== 'string' || !source) {
       res.status(400).json({ error: 'source_required' });
       return;
     }
     const found = typeof token === 'string' && token ? await userFromToken(token) : null;
-    const decision = gateStreamAccess(found?.user, source);
+    // `pl` mirrors the sidecar-mode streamGate's third rung. An older sidecar omits it → undefined → the check
+    // is skipped, exactly as before, so the seam stays backward-compatible across a partial upgrade.
+    const decision = gateStreamAccess(found?.user, source, typeof pl === 'string' ? pl : undefined);
     if (!decision.ok) {
       res.json({ ok: false, status: decision.status, message: decision.message });
       return;

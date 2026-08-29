@@ -46,7 +46,7 @@ export interface PlaylistChannelDoc {
   // distinct from a stored null (its original tvg_id was unlinked). Never in a $set/$setOnInsert bucket,
   // so it rides re-sync untouched. See services/failover.ts failoverDisbandUpdate for the restore.
   origTvgId?: string | null;
-  // Operator's preferred upstream "player" for sources that expose several (adapter.playerSelectable — dlhd/dami's
+  // Operator's preferred upstream "player" for sources that expose several (adapter.playerSelectable — dlhd's
   // DaddyLive Player 1..N). 1-based; null/absent = inherit the source-wide default (Settings.dlhdPlayer). Read at
   // resolve time by the seam (buildGrant) and honored+failed-over by the adapter's resolveStream. OPTIONAL — older
   // docs lack it (treat undefined as null). $setOnInsert-only, like the failover fields, so it survives re-sync.
@@ -60,6 +60,11 @@ export interface PlaylistChannelDoc {
     isPlayable: boolean;
     res: string | null;
     status: string | null; // realtime: 'live'|'establishing'|'buffer'|'failed'|null
+    // Probed container: 'ts' | 'fmp4' | null (unknown / never probed). Written by the channel-probe sweep from
+    // the sidecar's manifest inspection (#EXT-X-MAP ⇒ fmp4, else #EXTINF ⇒ ts). Persisted because container
+    // decides real delivery capability — raw-TS output and any future concatenating path can serve `ts` and
+    // must fall back for `fmp4` — so it needs to be answerable per channel WITHOUT re-probing the fleet.
+    container: string | null;
     probe: unknown; // VESTIGIAL: was the deep decode/technical-details snapshot; always null after the video-engine
     //                teardown (nothing writes it). Kept as a nullable slot to repurpose when playback is rebuilt.
   };
@@ -97,6 +102,7 @@ const PlaylistChannelSchema = new Schema<PlaylistChannelDoc>(
       isPlayable: { type: Boolean, required: true },
       res: { type: String, default: null },
       status: { type: String, default: null },
+      container: { type: String, default: null }, // 'ts' | 'fmp4' | null — see the interface
       // Channel-probe decode-metadata snapshot (latest); null until first probed. Whole object is $set by the proxy
       // probe sink (routes/sources.ts), never mutated in place — Mixed is safe here.
       probe: { type: Schema.Types.Mixed, default: null },

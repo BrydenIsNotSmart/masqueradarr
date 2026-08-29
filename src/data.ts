@@ -169,6 +169,10 @@ export interface ActiveStream {
   source: string;
   phase: 'live' | 'establishing' | 'buffer' | 'failed';
   status: 'good' | 'warn' | 'bad';
+  // Retries spent against the channel's budget, and whether it has ever streamed. `retry` reads 0 both for a
+  // healthy channel and for one whose failed-cooldown just expired, so the pair is what distinguishes
+  // "coming up for the first time" from "was live, now recovering" — the phase alone shows them identically.
+  retry?: number; everStreamed?: boolean;
   uptime: string; uptimeMin: number;
   viewers: number; peakViewers: number;
   watchers: string[]; // distinct usernames watching (anonymous viewers omitted; never the token)
@@ -182,9 +186,73 @@ export interface ActiveStream {
   bytesTotal: number;
   codec: string | null; audio: string | null; container: string | null;
   resolution: string | null; fps: number | null;
+  // The manifest-DECLARED rate of the variant being carried, in raw BITS/sec off #EXT-X-STREAM-INF BANDWIDTH.
+  // Not `bandwidth` (Mbps of egress summed across viewers) and not `bitrate` (per-viewer measured Mbps) —
+  // declared-vs-measured is exactly the comparison that shows an upstream under-delivering.
+  declaredBps?: number | null;
+  // What the UPSTREAM is — 'ts' | 'hls-master' | 'hls-media'. Three different questions live near each other
+  // and must not be conflated: this is what we PULL, `delivery` is what we SERVE, and `container` is what the
+  // segments themselves are. A raw-TS upstream can be served as HLS, and an HLS master as raw TS.
+  // The server resolves the origin-vs-passthrough precedence before sending it.
+  upstreamShape?: string | null;
+  // Declared encryption METHOD — 'NONE' | 'AES-128' | 'SAMPLE-AES' | … 'NONE' is a MEASUREMENT of cleartext;
+  // absent/null means nothing has reported one. This is what explains a Raw-TS request served as HLS: the
+  // passthrough muxer cannot decrypt, so an AES-128 upstream forces the fallback (the origin ring can).
+  encryption?: string | null;
+  // How this channel's LAST viewer session ended. Necessarily a PAST event about an already-departed viewer —
+  // this screen only lists channels that still have one — and null until a first session has ended here.
+  // `socketBound` is what says whether `reason` is a real CAUSE (raw-TS sockets report one) or merely the
+  // MECHANISM by which we noticed (an HLS viewer never announces leaving; its polls just stop).
+  lastClose?: { reason: string; at: number; socketBound: boolean } | null;
   probe: StreamProbe | null;
+  // S3/ORIGIN Side-1 (ingest) health — non-null only for an origin-backed channel. The counterpart to
+  // `delivery` (Side-2). `ingestedBytes` is UPSTREAM traffic for the ONE shared ingest and is deliberately
+  // not comparable to `bandwidth` (egress across all viewers): with N viewers, egress ≈ N × ingest, and that
+  // divergence is the signal that the ring is doing its job.
+  // Every field below is OPTIONAL on purpose (the `suspect` precedent). This interface is a hand-maintained
+  // mirror of the server's IngestHealth — the two packages never import across the boundary — so a sidecar or
+  // server that has not been rebuilt yet must degrade to "not measured", not break the build or render
+  // `undefined`. Read them with an explicit presence check, never with `?? 0`, or a missing field becomes an
+  // authoritative zero.
+  ingest: {
+    status: string; subscribers: number;
+    ringSegments: number; ringBytes: number;
+    // The live applied cap for THIS channel — `ringBytes`' denominator. Not the configured originRingMb, and
+    // not the process-wide Σ on the system-stats socket; all three can differ at the same instant.
+    channelRingCapBytes?: number;
+    // Σ of the held segments' real durations, and "we are over cap because the MIN_SEGMENTS floor won".
+    ringSeconds?: number; floorBeatsCap?: boolean;
+    headSeq: number; generation: number;
+    // Disjoint: tags that have LEFT the window vs. tags still in it. Never add them together.
+    discSeq?: number; discInWindow?: number;
+    ingestedSegments: number; ingestedBytes: number; evictedSegments: number;
+    // S3/UND: non-null once an upstream has been retired for a structural fault the byte counters cannot see.
+    suspect?: string | null; suspectRetires?: number;
+    // `ineligible` non-null ⇒ the origin DECLINED this upstream and the rewrite path is serving instead —
+    // the one case where a live ingest frame does NOT mean the ring is authoring the output.
+    demuxed?: boolean; ineligible?: string | null;
+    targetDuration: number; at: number;
+  } | null;
   // Failover attribution: non-null while a failover CHILD is serving under this (parent) channel's identity.
   failover: { attempt: number; candidateId: string; candidateName: string } | null;
+  // S3/CUE Side-1 ad-break state — non-null only once the data plane has DETECTED a break on this channel,
+  // so it stays null for every source that emits no cue tags and declares no ad-URI signature.
+  // `profileChanged` is the one that matters: it says the decoder had to reconfigure across the splice,
+  // which is why the break cannot simply be smoothed over.
+  adBreak: {
+    inBreak: boolean; signal: string; breakId: number;
+    segments: number; durationSec: number; announcedSec: number;
+    profileChanged: boolean; breaksSeen: number; totalBreakSec: number; at: number;
+  } | null;
+  // The host this channel's grant ENTRY hop resolved to. `source` names the adapter; on a multi-provider
+  // source that says nothing about which provider is on air. Label it as the ENTRY host — the data plane
+  // grows its allow-set per manifest, so segments routinely come from a different CDN host than this one.
+  upstreamHost?: string | null;
+  // The proxy config the grant was built FROM — the requested half of requested-vs-served (`delivery` is the
+  // served half). `outputFormat: 'ts'` with `delivery: 'hls'` IS the Raw-TS-fell-back signal. Typed `string`
+  // rather than a literal union deliberately: the format list is a server const with no shared type across
+  // the package boundary, so a union here would drift silently the day a third format lands.
+  requested?: { outputFormat: string; originEnabled: boolean; originRingMb: number; spliceNormalize: boolean } | null;
 }
 // One connected viewer of an active stream (GET /api/active-streams/:channelId/clients).
 export interface StreamClient {
@@ -194,6 +262,13 @@ export interface StreamClient {
   connectedAt: number; lastSeen: number;
   bytes: number; currentRate: number; // bytes total, bytes/sec over the last tick
   segments: number;
+  // Per-viewer QoE — the only place a single stalling client is visible, since the channel-wide egress rate
+  // averages it away. The two are deliberately out of step: the COUNT rises when a stall begins, the
+  // DURATION only when it ends, so `1 stall · 0.0 s` means "stalling right now" and is a valid reading.
+  bufferCount?: number; rebufferMs?: number;
+  // This viewer holds a continuous raw-TS socket rather than polling segments — why its byte cadence looks
+  // nothing like its neighbours' on the same channel.
+  socketBound?: boolean;
   location?: string | null; // geo resolved from `ip` server-side ("City, Region, US" / "Local"); null/absent = geo off
   countryCode?: string | null; // ISO-3166-1 alpha-2 for the flag emoji
 }
@@ -274,8 +349,21 @@ export interface SourceManifestEntry {
   sourceUrl: string;
   proxyPrefix: string;
   statusUrl: string | null;
+  // This source exposes several interchangeable upstream "players" per channel (DaddyLive), so the player
+  // picker is rendered for its channels. Read it instead of hardcoding source ids — see playerSelectable().
+  playerSelectable?: boolean;
   // The Add Playlist "Built-In" summary (server fills DEFAULT_BUILTIN_META when an adapter omits it).
   builtinMeta: BuiltinPlaylistMeta;
+}
+
+/**
+ * Does this channel's real provider expose selectable players? Route on the PROXY source (`origin ?? source`)
+ * — the same key the stream URL is built from — so a clone copy is judged by its real provider, and read the
+ * capability off the source manifest so a future player-selectable adapter lights the picker up for free.
+ */
+export function playerSelectable(ch: Pick<Channel, 'source' | 'origin'>): boolean {
+  const id = ch.origin ?? ch.source;
+  return SOURCES.value.some((s) => s.id === id && s.playerSelectable === true);
 }
 // Structured frequency-builder state (mirrors server CronFrequency) — lets the Edit drawer re-render the
 // builder without reverse-parsing the cron string. `mode` selects which other fields apply.
@@ -313,6 +401,15 @@ export interface SystemStats {
   scope: 'cgroup-v2' | 'cgroup-v1' | 'host';
   cpu: { usagePct: number | null; cores: number; loadAvg: [number, number, number] };
   memory: { totalBytes: number; usedBytes: number; usedPct: number; rssBytes: number };
+  // S3/ORIGIN segment rings, process-wide — the Rust sidecar's RAM, which memory.rssBytes (the Node process)
+  // does not see. null = the sidecar never reported or went silent (origin disabled, or no sidecar).
+  ring: {
+    bytes: number;
+    capBytes: number;
+    origins: number;
+    subscribed: number;
+    pressurePct: number;
+  } | null;
   diskIo: { readMbPerSec: number; writeMbPerSec: number } | null;
   network: { rxMbitPerSec: number; txMbitPerSec: number } | null;
   mongo: {
@@ -927,17 +1024,9 @@ export async function reloadUserMetrics(): Promise<void> {
   USER_METRICS.value = await getJson<UserMetric[]>('/api/view-sessions/user-metrics');
 }
 
-// appPlayer proxy path for a source-playlist channel: /api/v1/<source>/<enc streamEntryUrl>. This is the
-// IN-APP player's stream URL (prefixed `appPlayer*` to distinguish it from the externalPlayer /api/ext
-// mount the M3U composer writes for third-party IPTV clients). Derived here (not stored) so a proxy-mount /
-// dlhd mirror change needs no data rewrite. Null for legacy channels.
-export function appPlayerProxyPath(ch: Channel): string | null {
-  // A clone copy's proxy source is its provider (`origin`, e.g. 'dulo') — its `source` is the clone id; a
-  // source-playlist channel's is its `source` (origin null). Mirrors serialize.ts (channelToExtinf).
-  const src = ch.origin || ch.source;
-  if (!ch.streamEntryUrl || !src) return null;
-  return `/api/v1/${src}/${encodeURIComponent(ch.streamEntryUrl)}`;
-}
+// appPlayerProxyPath now lives in streamPath.ts (dependency-free, so the standalone player.html entry can
+// import it without pulling in this whole module). Re-exported here so every existing caller is unchanged.
+export { appPlayerProxyPath } from './streamPath';
 
 // ISO-3166-1 alpha-2 → flag emoji (regional-indicator pair). Empty string for missing/invalid codes, so a
 // row with no resolved country just shows its location label (or an em-dash). Shared by the Active Streams +

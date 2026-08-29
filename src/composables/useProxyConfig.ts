@@ -20,6 +20,11 @@ export interface ProxyConfigState {
   failoverEnabled: boolean; // LIVE — play-time failover groups (walk the ordered children on an establish failure); default ON
   failoverOnDefiniteError: boolean; // LIVE — also fail over on a definitive upstream 4xx/5xx (normally forwarded verbatim); default OFF
   segmentCacheTtlSec: number | null; // reserved (the only unapplied knob)
+  // S3/ORIGIN — republish from a local origin instead of proxying the upstream manifest. One refcounted
+  // ingest per channel decrypts + rings segments; the client gets a masqueradarr-authored stream.
+  originEnabled: boolean; // LIVE — default OFF (off is byte-identical to today's output)
+  originRingMb: number; // LIVE — per-channel ring cap (MiB); a 3-segment floor still wins over it
+  spliceNormalize: boolean; // LIVE — default ON; origin-only kill switch for splice/pid normalisation
 }
 
 export type ProxyConfigSaveState = 'idle' | 'saving' | 'saved' | 'error';
@@ -38,6 +43,9 @@ export function proxyConfigDefaults(): ProxyConfigState {
     failoverEnabled: true,
     failoverOnDefiniteError: false,
     segmentCacheTtlSec: null,
+    originEnabled: false,
+    originRingMb: 25,
+    spliceNormalize: true,
   };
 }
 
@@ -56,6 +64,9 @@ function normalize(raw: unknown): ProxyConfigState {
         : {},
     outputFormat: typeof s.outputFormat === 'string' ? s.outputFormat : d.outputFormat,
     streamInfRedux: typeof s.streamInfRedux === 'boolean' ? s.streamInfRedux : false,
+    originEnabled: typeof s.originEnabled === 'boolean' ? s.originEnabled : d.originEnabled,
+    originRingMb: typeof s.originRingMb === 'number' ? s.originRingMb : d.originRingMb,
+    spliceNormalize: typeof s.spliceNormalize === 'boolean' ? s.spliceNormalize : d.spliceNormalize,
     failoverEnabled: typeof s.failoverEnabled === 'boolean' ? s.failoverEnabled : true,
     failoverOnDefiniteError:
       typeof s.failoverOnDefiniteError === 'boolean' ? s.failoverOnDefiniteError : false,

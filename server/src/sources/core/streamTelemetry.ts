@@ -257,15 +257,66 @@ export interface MediaInfo {
   frameRate: string | null; // raw "60" / "29.970"
   container: string | null; // 'fmp4' | 'ts'
   bandwidth: number | null; // declared BANDWIDTH (bits/sec) — the client-side buffering reference (BUF)
+  /** What the upstream IS — 'hls-master' | 'hls-media' — as opposed to `container`, which is what its
+   *  SEGMENTS are. Sent only on the ENTRY poll: a hop's body is always a media playlist, so it sends null
+   *  and the merge below leaves the entry's answer standing. */
+  upstreamShape: string | null;
+  /** Declared encryption METHOD — 'NONE' | 'AES-128' | 'SAMPLE-AES' | … Sent only on a MEDIA-playlist poll,
+   *  the exact inverse of `upstreamShape`: `#EXT-X-KEY` never appears in a master. 'NONE' is a MEASUREMENT of
+   *  cleartext and must not be confused with null, which means nothing has reported yet. */
+  encryption: string | null;
 }
 
-const mediaByChannel = new Map<string, MediaInfo>(); // channelKey → merged decode metadata
+// channelKey → merged decode metadata. Bounded by the CHANNEL AGGREGATE's lifetime: the tick that drops a
+// cold aggregate drops this with it (see the `channels.delete` site). Deliberately NOT in statsHub's
+// activeKeys prune block with the display-only maps — the reasons are spelled out at that delete.
+/** Every DISPLAY-ONLY per-channel map, registered on creation so one sweep prunes them all.
+ *
+ * The pattern this replaces was a hand-written `prune<Name>(activeKeys)` per map plus a matching call in
+ * statsHub — six of each by the end. Nothing enforced the pairing: a new map whose prune or whose call site
+ * was forgotten grew without bound, keyed by every channel ever played, and nothing would ever say so.
+ * Registering at declaration makes the omission unrepresentable.
+ *
+ * DISPLAY-ONLY is the entry requirement, not a description. `activeKeys` is built by statsHub and pruned
+ * only while an admin socket is open, so a map that any DETECTION path reads must not be in here — see
+ * `mediaByChannel`, which is deliberately kept out and torn down with the channel aggregate instead. */
+const displayMaps: Map<string, unknown>[] = [];
 
-/** Merge manifest-declared decode metadata for a channel (only the non-null fields of this poll overwrite). */
-export function noteMedia(source: string, entryUrl: string, m: MediaInfo): void {
+function displayMap<V>(): Map<string, V> {
+  const m = new Map<string, V>();
+  displayMaps.push(m as Map<string, unknown>);
+  return m;
+}
+
+/** Drop every display-only map's entries for channels that are no longer active. One sweep, all maps. */
+export function pruneChannelDisplayMaps(activeKeys: Set<string>): void {
+  for (const m of displayMaps) {
+    for (const key of m.keys()) if (!activeKeys.has(key)) m.delete(key);
+  }
+}
+
+// NOT a `displayMap`, deliberately: the client-shortfall heuristic reads this one's `bandwidth`, so pruning
+// it from `activeKeys` would make buffering DETECTION depend on whether an admin has the screen open. It is
+// torn down with the channel aggregate instead — see the long note at its delete site for the two reasons
+// and for why a sweep over this map is not equivalent.
+const mediaByChannel = new Map<string, MediaInfo>();
+
+/**
+ * Record manifest-declared decode metadata for a channel.
+ *
+ * TWO producers with genuinely different semantics, hence `replace`:
+ *  - The passthrough rewriter polls the master and the media playlist SEPARATELY, so each frame is partial
+ *    and `null` means "no update this poll" — those must MERGE, or the master's resolution would be erased
+ *    by the next variant poll. That is the default.
+ *  - The origin resolver extracts both playlists in ONE pass, so its frame is a COMPLETE snapshot of the
+ *    upstream it just resolved and `null` means "this upstream declares nothing". Merging those would pin a
+ *    retired provider's resolution/bandwidth forever across a failover or an escalation onto a leaner
+ *    upstream — and that stale bandwidth is what the panel compares the served bitrate against.
+ */
+export function noteMedia(source: string, entryUrl: string, m: MediaInfo, replace = false): void {
   const key = streamKey(source, entryUrl);
   const cur = mediaByChannel.get(key);
-  if (!cur) {
+  if (!cur || replace) {
     mediaByChannel.set(key, { ...m });
     return;
   }
@@ -274,6 +325,8 @@ export function noteMedia(source: string, entryUrl: string, m: MediaInfo): void 
   if (m.frameRate !== null) cur.frameRate = m.frameRate;
   if (m.container !== null) cur.container = m.container;
   if (m.bandwidth !== null) cur.bandwidth = m.bandwidth;
+  if (m.upstreamShape !== null) cur.upstreamShape = m.upstreamShape;
+  if (m.encryption !== null) cur.encryption = m.encryption;
 }
 
 /** The merged decode metadata for a channel (null until its first manifest declares anything). */
@@ -286,7 +339,8 @@ export function mediaFor(channelKey: string): MediaInfo | null {
 // keys on (parent source, parent entry) — so without this note Active Streams would show the parent as
 // live with no hint a backup is carrying it. The resolve seam records the serving candidate at grant-build
 // time: attempt >= 1 sets it, a successful attempt-0 (parent) resolve clears it. Same in-memory idiom as
-// mediaByChannel; statsHub prunes entries for channels that go cold.
+// mediaByChannel, but — being display-only — it is pruned from statsHub's activeKeys rather than with the
+// channel aggregate (see mediaByChannel's declaration for why that distinction matters).
 
 export interface FailoverServing {
   attempt: number; // 1-based candidate attempt (1 = first child)
@@ -294,7 +348,7 @@ export interface FailoverServing {
   candidateName: string; // the serving child's tvg_name (display)
 }
 
-const failoverByChannel = new Map<string, FailoverServing>(); // channelKey → serving candidate
+const failoverByChannel = displayMap<FailoverServing>(); // channelKey → serving candidate
 
 /** Record (or clear, with null) which failover candidate a channel's grants currently target. */
 export function noteFailoverServing(source: string, entryUrl: string, f: FailoverServing | null): void {
@@ -309,8 +363,247 @@ export function failoverFor(channelKey: string): FailoverServing | null {
 }
 
 /** Drop failover attribution for channels no longer active (statsHub calls this with the live key set). */
-export function pruneFailoverServing(activeKeys: Set<string>): void {
-  for (const key of failoverByChannel.keys()) if (!activeKeys.has(key)) failoverByChannel.delete(key);
+// ── Upstream attribution: which HOST is actually carrying this channel ─────────────────────────────────
+// The channel row names a SOURCE (`dlhd`), which for a multi-provider source says nothing about which of its
+// interchangeable providers is on air right now. The resolve seam knows — it just discarded it. Same
+// in-memory idiom and the same (parent source, parent entry) key as the failover map above, so a child
+// serving under its parent's identity files its host under the parent, where statsHub can join it.
+
+const hostByChannel = displayMap<string>(); // channelKey → entry-hop host
+
+/** Record the host a channel's grant currently resolves to. Callers MUST pass the caller's own (source,
+ *  entryUrl), never a resolved candidate's — see noteFailoverServing for why. */
+export function noteUpstreamHost(source: string, entryUrl: string, host: string): void {
+  hostByChannel.set(streamKey(source, entryUrl), host);
+}
+
+/** The entry-hop host serving a channel (null = nothing resolved yet). NOT necessarily the host serving
+ *  segments: the data plane grows its allow-set from each manifest, so segments routinely come from a
+ *  different CDN host than the master. */
+export function upstreamHostFor(channelKey: string): string | null {
+  return hostByChannel.get(channelKey) ?? null;
+}
+
+/** Drop host attribution for channels no longer active (statsHub calls this with the live key set). */
+// ── The proxy config a stream was actually GRANTED ──────────────────────────────────────────────────────
+// Answers the one question the panel could not: "I set Raw-TS and I am still being served HLS — why?" The
+// served half is `delivery`; this is the requested half, captured where it is resolved rather than re-read
+// from the DB (a re-read answers a different question — what is configured NOW, not what this stream got).
+
+/** The four scalars only. Deliberately NOT the runtime config object: that carries operator-supplied
+ *  `headerOverrides`, which can hold Authorization/Cookie values, and this shape is broadcast verbatim to
+ *  every connected admin socket. Keeping it narrow also keeps this DB-free core free of a Mongo-adjacent
+ *  type. */
+export interface RequestedConfig {
+  outputFormat: string;
+  originEnabled: boolean;
+  originRingMb: number;
+  spliceNormalize: boolean;
+}
+
+const requestedByChannel = displayMap<RequestedConfig>(); // channelKey → config resolved into the grant
+
+/** Record the proxy config resolved into a channel's grant. */
+export function noteRequestedConfig(source: string, entryUrl: string, c: RequestedConfig): void {
+  requestedByChannel.set(streamKey(source, entryUrl), c);
+}
+
+/** The config a channel's current grant was built from (null = nothing granted yet). */
+export function requestedConfigFor(channelKey: string): RequestedConfig | null {
+  return requestedByChannel.get(channelKey) ?? null;
+}
+
+/** Drop requested config for channels no longer active (statsHub calls this with the live key set). */
+// ── How this channel's last viewer session ENDED ───────────────────────────────────────────────────────
+// A closed session leaves the `clients` map by definition, so nothing about it survives into the live
+// snapshot — `closeSession` feeds ClosedSession → ViewSession, which is History, not Active Streams. This map
+// is the one live surface for it.
+//
+// Read it as a PAST event on a live panel: Active Streams only lists channels that still have a viewer, so
+// this necessarily describes a DIFFERENT viewer who has already left while others are still watching. It is
+// null on a channel whose first session has not ended yet, which is a real state and not an error.
+
+export interface LastClose {
+  /** Raw-TS sockets get a real cause from the data plane (`endlist`, `failover_exhausted`, `pair_declines`,
+   *  `ingest_stopped`, `client_gone`). HLS poll clients can only ever report the MECHANISM (`poll_timeout`) —
+   *  they never announce a departure, the polls just stop. Anything rendering this must not present the two
+   *  as equally informative. */
+  reason: string;
+  at: number;
+  /** Whether that session was a raw-TS socket — i.e. whether `reason` is a cause or only a mechanism. */
+  socketBound: boolean;
+}
+
+const lastCloseByChannel = displayMap<LastClose>(); // channelKey → how the last session ended
+
+/** The last session end for a channel (null = no session has ended on it yet). */
+export function lastCloseFor(channelKey: string): LastClose | null {
+  return lastCloseByChannel.get(channelKey) ?? null;
+}
+
+/** Drop close attribution for channels no longer active (statsHub calls this with the live key set). */
+// ── S3/ORIGIN ingest health (the `iop` side) ───────────────────────────────────────────────────────────
+// Everything else in this file measures EGRESS — bytes we sent to a viewer. Origin mode adds a second,
+// independent quantity: what ONE ingest pulled from upstream on behalf of N viewers. Conflating them would
+// over-count upstream bandwidth by a factor of N and make a Side-1 problem indistinguishable from a Side-2
+// one, so ingest lands here in its own map and NEVER touches noteBytes. Same in-memory idiom as
+// failoverByChannel, and display-only like it, so statsHub prunes it from activeKeys.
+
+export interface IngestHealth {
+  status: string; // 'ok' | 'stalled' | 'resolve_failed' | 'closed' — the ingest's last reported state
+  subscribers: number; // live leases (viewers sharing this one ingest)
+  ringSegments: number;
+  ringBytes: number;
+  /** THIS channel's live applied cap in bytes — the denominator `ringBytes` needs to mean anything. NOT the
+   *  configured `originRingMb` (a shrink is applied lazily) and NOT the process-wide Σ that
+   *  `noteRingFootprint` carries; all three legitimately differ at the same instant. */
+  /** UNDEFINED means "this sidecar did not report it" — a distinct state from any value, and the reason
+   *  these fields are not plain numbers/booleans. An older sidecar (mid-upgrade, or the aio image's split
+   *  rebuild) omits the keys this release added; coercing them to 0/false/null at the ingest seam would
+   *  state a measurement nobody took, and the panel's version-skew branches all test `undefined`. */
+  channelRingCapBytes: number | undefined;
+  /** Σ of the held segments' own durations — the real window length, as opposed to
+   *  `ringSegments × targetDuration`, which over-reads by each segment's gap below the window max. */
+  ringSeconds: number | undefined;
+  /** The byte cap could not be honored because the MIN_SEGMENTS floor won: this channel's bitrate does not
+   *  fit its ring budget. While true, `ringBytes` legitimately exceeds `channelRingCapBytes`. */
+  floorBeatsCap: boolean;
+  headSeq: number; // our next sequence — monotonic for the life of the ingest
+  generation: number; // bumped on a failover ring reset
+  /** RFC 8216's EXT-X-DISCONTINUITY-SEQUENCE: discontinuity tags that have already LEFT the window. */
+  discSeq: number | undefined;
+  /** Discontinuity tags still INSIDE the window. Disjoint from `discSeq` — never sum the two. */
+  discInWindow: number | undefined;
+  ingestedSegments: number;
+  ingestedBytes: number; // UPSTREAM bytes — distinct from egress; one of these can serve N viewers
+  evictedSegments: number;
+  targetDuration: number;
+  /** True when the origin paired a separate audio rendition into every segment (a DEMUXED upstream). */
+  demuxed: boolean | undefined;
+  /** Non-null ⇒ the origin DECLINED this upstream (fMP4 / SAMPLE-AES / unpairable audio) and the rewrite
+   *  path is serving the client instead. The ingest keeps reporting either way, so without this field a
+   *  declined channel is indistinguishable from a healthy ring-backed one. */
+  ineligible: string | null | undefined;
+  /** What the ORIGIN's upstream turned out to be — 'ts' | 'hls-master' | 'hls-media'. The authoritative
+   *  reading for a ring-backed channel; the passthrough rewriter reports the same idea onto MediaInfo, and a
+   *  channel with an INELIGIBLE origin legitimately has both. */
+  upstreamShape: string | null;
+  /** Declared encryption METHOD as the ORIGIN found it — 'NONE' | 'AES-128' | 'SAMPLE-AES' | … Recorded
+   *  before the eligibility guards, so a channel DECLINED for its encryption still names it here. */
+  encryption: string | null;
+  at: number; // Date.now() of the last iop event — staleness tells you an ingest stopped reporting
+  /** S3/UND: slug of the last structural fault that retired an upstream (`undecodable-video`,
+   *  `not-transport-stream`), or null if none. Non-null means this channel has been hopping providers —
+   *  a state every other field here reports as healthy, because fetching IS working. */
+  suspect: string | null | undefined;
+  suspectRetires: number;
+}
+
+const ingestByChannel = displayMap<IngestHealth>(); // channelKey → last ingest snapshot
+
+/** Record the data plane's latest `iop` snapshot for a channel. */
+export function noteIngest(source: string, entryUrl: string, h: IngestHealth): void {
+  ingestByChannel.set(streamKey(source, entryUrl), h);
+}
+
+/** The ingest health for a channel (null = not origin-backed, or nothing reported yet). */
+export function ingestFor(channelKey: string): IngestHealth | null {
+  return ingestByChannel.get(channelKey) ?? null;
+}
+
+/** Drop ingest health for channels no longer active (statsHub calls this with the live key set). */
+// ── S3/CUE: ad-break state (per channel) ────────────────────────────────────────────────────────────────
+// An EVENT stream, not a health snapshot: the sidecar sends exactly two frames per break (open/close), so
+// this map holds "what is happening on this channel right now" plus a small rolling tally the operator can
+// read a duty cycle off. Kept beside ingest health (same key, same prune) because a break is an INGEST-side
+// observation — it is never allowed to touch an egress sink, same rule as `iop`.
+
+export interface AdBreakState {
+  /** True between an `open` and its `close` — the channel is serving ad content right now. */
+  inBreak: boolean;
+  /** Which signal detected it: 'CueTag' | 'DateRange' | 'UriSignature'. */
+  signal: string;
+  /** Sidecar-local label, for correlating the open/close pair in the logs. */
+  breakId: number;
+  /** Segments seen in the CURRENT (or most recent) break. */
+  segments: number;
+  /** Observed seconds so far in the current break, or the final total once closed. */
+  durationSec: number;
+  /** What the cue tag announced, when it announced anything (0 = unannounced, e.g. every pluto break). */
+  announcedSec: number;
+  /** Whether the decoder configuration actually changed at this edge — the Phase 2 gate. */
+  profileChanged: boolean;
+  /** Breaks completed since this ingest started, and their summed observed duration. */
+  breaksSeen: number;
+  totalBreakSec: number;
+  at: number; // Date.now() of the last cue event
+}
+
+const adBreakByChannel = displayMap<AdBreakState>();
+
+/** Record an ad-break edge from the data plane. `state` is 'open' or 'close'. */
+export function noteAdBreak(
+  source: string,
+  entryUrl: string,
+  state: string,
+  b: Omit<AdBreakState, 'inBreak' | 'breaksSeen' | 'totalBreakSec' | 'at'>,
+): void {
+  const key = streamKey(source, entryUrl);
+  const prev = adBreakByChannel.get(key);
+  const closing = state === 'close';
+  adBreakByChannel.set(key, {
+    ...b,
+    inBreak: !closing,
+    // Tally only on close, so a break in progress is never double-counted when it finally ends.
+    breaksSeen: (prev?.breaksSeen ?? 0) + (closing ? 1 : 0),
+    totalBreakSec: (prev?.totalBreakSec ?? 0) + (closing ? b.durationSec : 0),
+    at: Date.now(),
+  });
+}
+
+/** Ad-break state for a channel (null = no break ever seen — the normal case for most sources). */
+export function adBreakFor(channelKey: string): AdBreakState | null {
+  return adBreakByChannel.get(channelKey) ?? null;
+}
+
+/** Drop ad-break state for channels no longer active (statsHub calls this with the live key set). */
+// ── S3/ORIGIN aggregate ring footprint (process-wide) ──────────────────────────────────────────────────
+// The map above is PER-CHANNEL and is pruned against the active-stream set, so it cannot answer "how much RAM
+// are the rings holding" — an origin inside its 30s idle grace still owns its bytes with no active row to hang
+// them off, which is exactly the case a memory-pressure reading must not miss. The sidecar therefore sums its
+// own registry and reports one `ring` event; this holds the latest. Feeds systemStatsHub → the Dashboard's
+// MEMORY PRESSURE tile.
+
+export interface RingFootprint {
+  origins: number;
+  subscribed: number; // origins with ≥1 viewer; the rest are in their idle grace, still costing RAM
+  bytes: number;
+  capBytes: number; // Σ of those origins' per-channel caps — headroom before eviction, NOT a global ceiling
+  at: number; // Date.now() of the frame
+}
+
+let ringFootprint: RingFootprint | null = null;
+
+/** How long a footprint reporting LIVE origins stays trustworthy before we call the sidecar gone. */
+const RING_STALE_MS = 15_000; // 6 missed 2.5s reports
+
+/** Record the data plane's latest process-wide `ring` snapshot. */
+export function noteRingFootprint(f: RingFootprint): void {
+  ringFootprint = f;
+}
+
+/**
+ * The latest ring footprint, or null when there is nothing trustworthy to show.
+ *
+ * Staleness applies ONLY to a frame that reported live origins: the sidecar goes deliberately quiet once the
+ * last ingest closes, so a trailing `origins: 0` is a standing fact, not a stale reading, and must keep being
+ * served. A frame with origins still running that then went silent means the sidecar died — report null and
+ * let the tile degrade rather than freeze on a number that is no longer true.
+ */
+export function getRingFootprint(): RingFootprint | null {
+  if (!ringFootprint) return null;
+  if (ringFootprint.origins > 0 && Date.now() - ringFootprint.at > RING_STALE_MS) return null;
+  return ringFootprint;
 }
 
 // ── Socket-liveness hooks (the raw-TS fork) ───────────────────────────────────────────────────────────
@@ -379,18 +672,20 @@ export function noteSocketBytes(connId: number, bytes: number): void {
   c.lastSeen = Date.now();
 }
 
-/** Close a raw-TS viewer session when its socket closes — emits the same ClosedSession the HLS sweep does. */
-export function noteSocketViewerClose(connId: number): void {
+/** Close a raw-TS viewer session when its socket closes — emits the same ClosedSession the HLS sweep does.
+ *  `reason` comes from the data plane's close frame (the only party that knows WHY the socket ended); absent
+ *  for a sidecar that does not report one. */
+export function noteSocketViewerClose(connId: number, reason?: string | null): void {
   const key = `socket|${connId}`;
   const c = clients.get(key);
   if (!c) return; // backstop already closed it
-  closeSession(c, Date.now());
+  closeSession(c, Date.now(), reason || 'socket_close');
   clients.delete(key);
 }
 
 // ── Tick: rolling rates, buffering-event detection, stale sweep ───────────────────────────────────────
 
-function closeSession(c: ClientConn, endedAt: number): void {
+function closeSession(c: ClientConn, endedAt: number, reason: string): void {
   // Finalise any still-open buffering interval against this client (a client swept mid-buffer still records the
   // partial duration) — fill each open event's ms + fold it into rebufferMs before the session is snapshotted.
   if (c.upstreamOpen) {
@@ -403,6 +698,9 @@ function closeSession(c: ClientConn, endedAt: number): void {
     c.rebufferMs += c.clientOpen.ms;
     c.clientOpen = null;
   }
+  // The live surface for this ending. Recorded before the ClosedSession is handed to the History sink, which
+  // is the only other place it goes — and which the Active Streams panel cannot read.
+  lastCloseByChannel.set(c.channelKey, { reason, at: endedAt, socketBound: c.socketBound === true });
   const durationMs = Math.max(0, endedAt - c.connectedAt);
   const s: ClosedSession = {
     source: c.source,
@@ -458,6 +756,31 @@ export function tick(): void {
     const bound = clientsOnChannel(channelKey);
     if (bound.length === 0 && ch.bufferingSince === null) {
       channels.delete(channelKey); // no viewers, not buffering → drop the aggregate
+      // Decode metadata dies with the aggregate, and is pruned HERE rather than from statsHub's `activeKeys`
+      // like every other per-channel map. Two reasons, both load-bearing:
+      //   1. `mediaByChannel` is not display-only — the client-shortfall heuristic below reads its `bandwidth`
+      //      as the reference bitrate, and skips silently when it is null. statsHub's prune runs only while an
+      //      admin socket is open (`if (sockets.size)`), so pruning there would make buffering DETECTION
+      //      depend on whether someone has the Active Streams screen open.
+      //   2. `activeKeys` is built after `if (!channelId) continue`, so it omits a live channel that has no
+      //      PlaylistChannel row — which would wipe that channel's reference bitrate every tick while it is
+      //      still streaming.
+      // This site has neither problem: it is the core's own definition of cold, it runs on every tick
+      // regardless of who is watching, and `bound.length === 0` guarantees no client below can still be
+      // referencing this key in the same pass.
+      //
+      // DO NOT "simplify" this into a sweep over the map (`for (key of mediaByChannel) if (!channels.has(key))
+      // delete`). That looks equivalent and is not: an ORIGIN channel emits its `media` frame when the ingest
+      // RESOLVES, but the aggregate is not created until a client's first manifest poll SUCCEEDS — and that
+      // poll blocks on `wait_ready` filling MIN_SEGMENTS (~3 target durations, 6-18 s). A sweep would run 3-9
+      // times inside that window, delete the metadata every cold start, and not get it back until the next
+      // re-resolve. Deleting only on the aggregate's own teardown cannot race that way.
+      //
+      // Residual, accepted: an origin lingering in its 30 s idle grace can re-resolve after this delete and
+      // re-create the entry with no aggregate left to remove it. That is one small object per channel that
+      // happened to renew while idle — bounded by the catalogue rather than by time, corrected on the next
+      // play, and the same residual `ingestByChannel` already carries.
+      mediaByChannel.delete(channelKey);
       continue;
     }
     ch.peakViewers = Math.max(ch.peakViewers, bound.length);
@@ -534,7 +857,11 @@ export function tick(): void {
   for (const [key, c] of clients) {
     const ttl = c.socketBound ? SOCKET_IDLE_MS : CLIENT_TTL_MS;
     if (now - c.lastSeen > ttl) {
-      closeSession(c, c.lastSeen);
+      // These two are MECHANISMS, not causes, and the naming keeps that honest. An HLS viewer never announces
+      // that it left — the polls simply stop — so `poll_timeout` covers a closed player and a dead channel
+      // alike. `socket_idle_backstop` is stronger: a raw-TS socket should have been reaped by its close frame,
+      // so reaching the 60 s no-byte backstop means the socket went half-open.
+      closeSession(c, c.lastSeen, c.socketBound ? 'socket_idle_backstop' : 'poll_timeout');
       clients.delete(key);
     }
   }
@@ -616,6 +943,18 @@ export interface ClientTelemetry {
   bytes: number;
   currentRate: number; // bytes/sec
   segments: number;
+  /** Per-viewer QoE that the aggregate egress rate cannot show — one stalling client is invisible in a
+   *  channel-wide Mbps figure.
+   *
+   *  THE TWO ARE DELIBERATELY OUT OF STEP. `bufferCount` is incremented when an interval OPENS; `rebufferMs`
+   *  is folded in only when it CLOSES. So a viewer stalling RIGHT NOW is already counted while contributing
+   *  no milliseconds yet, and `1 stall · 0.0 s` is a correct reading, not a bug. Anything rendering these
+   *  must say so — calling the count "completed intervals" describes the data backwards. */
+  bufferCount: number;
+  rebufferMs: number;
+  /** This viewer holds a continuous raw-TS SOCKET rather than polling HLS segments. Explains why one row's
+   *  cadence and byte pattern differ completely from its neighbours' on the same channel. */
+  socketBound: boolean;
   // GeoIP enrichment — left unset by this DB-free core; filled in by the activeStreams route (which owns the
   // geoip lookup) so the response shape stays a single shared type the SPA's StreamClient mirrors.
   location?: string | null;
@@ -634,6 +973,13 @@ export function clientsFor(channelKey: string): ClientTelemetry[] {
     bytes: c.bytes,
     currentRate: c.currentRate,
     segments: c.segments,
+    bufferCount: c.bufferCount,
+    rebufferMs: c.rebufferMs,
+    // `socketBound` is optional on ClientConn — only noteSocketViewerOpen sets it — so it is normalised here
+    // rather than published as `boolean | undefined`.
+    socketBound: c.socketBound === true,
+    // `bufferEvents` is deliberately NOT projected: it is an unbounded array only truncated at session close,
+    // and this shape rides a 4 s poll.
   }));
 }
 

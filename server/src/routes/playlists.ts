@@ -462,7 +462,7 @@ async function cascadeDeleteBuiltinPlaylist(p: {
     );
   }
 
-  // 2. The playlist-bound self-EPG source (tubi/dlhd/dami self-EPG; id === src, playlistBinding:true), if any.
+  // 2. The playlist-bound self-EPG source (tubi/dlhd self-EPG; id === src, playlistBinding:true), if any.
   //    cascadeDeleteEpgSource unlinks every playlistchannel linked to it — INCLUDING this built-in's own
   //    channels — and drops its programs/epgchannels/cronjob. dulo has none (crosswalk-only) → no-op.
   const bound = (await EpgSource.findOne(
@@ -639,6 +639,10 @@ playlistsRouter.get('/:id/channels', async (req: AuthRequest, res, next) => {
 // rendering (the Dashboard passes the currently-selected channel's own key).
 //   ?channelIds=<csv of "<epg>:<tvg_id>">   (required)
 //   ?from=<epoch-ms>  ?to=<epoch-ms>        (optional window; defaults to a bounded now-relative span)
+//   ?rich=1                                 (optional; also returns shortDesc/episodeTitle/season/episode/
+//                                            rating — see RichProgramFields. Meant for a NARROW id set: the
+//                                            Ultimate Player asks for the single channel being watched, and
+//                                            keeps using the lean projection for its channel rail.)
 playlistsRouter.get('/:id/programs', async (req: AuthRequest, res, next) => {
   try {
     if (req.user?.role === 'user') {
@@ -656,7 +660,8 @@ playlistsRouter.get('/:id/programs', async (req: AuthRequest, res, next) => {
     if (ids.length > MAX_CHANNEL_IDS) return res.status(400).json({ error: 'too_many_channel_ids' });
     const from = Number((req.query as Record<string, unknown>).from);
     const to = Number((req.query as Record<string, unknown>).to);
-    return res.json(await fetchProgramsGrouped(ids, from, to));
+    const rich = req.query.rich === '1' || req.query.rich === 'true';
+    return res.json(await fetchProgramsGrouped(ids, from, to, rich));
   } catch (err) {
     next(err);
   }
@@ -699,7 +704,7 @@ playlistsRouter.put('/:id/channels/:channelId', requireAdmin, async (req, res, n
         $set[key] = body[key];
       }
     }
-    // playerPref: preferred upstream player for playerSelectable sources (dlhd/dami). A 1-based integer, or
+    // playerPref: preferred upstream player for playerSelectable sources (dlhd). A 1-based integer, or
     // null to clear it (inherit the source-wide default). Numeric, so it can't ride the string loop above. An
     // out-of-range pick is accepted but clamps to the lead player at resolve time (resolveStream.ts).
     if (body.playerPref !== undefined) {

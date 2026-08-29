@@ -217,8 +217,15 @@ masqueradarr ships as Docker images. There are two deployment shapes.
 A second image bundles **app + MongoDB + config bootstrap** into one container, so the whole stack runs
 from a single `docker run` with no external database — ideal for a quick trial or a small home server. One
 `/data` volume persists the database, exports, config, and credentials. It's published under the
-**`iflip721/masqueradarr`** name (see **Migration status** above). *(On amd64, the bundled MongoDB 7.0
-requires a CPU with AVX; on hosts without it, use the compose stack.)*
+**`iflip721/masqueradarr`** name (see **Migration status** above).
+
+> **No-AVX hosts (Synology NAS, Atom/Celeron, older Xeons, kvm64/qemu64 VMs).** On amd64 the bundled
+> MongoDB 7.0 requires a CPU with AVX — without it mongod dies at boot with `Illegal instruction (core
+> dumped)`. Those hosts want the **`mongo4.4-`** tags, an otherwise-identical image built with MongoDB
+> 4.4 (which predates the AVX requirement): `iflip721/masqueradarr-aio:mongo4.4-latest`. It needs a
+> **fresh `/data` volume** — a database written by MongoDB 7.0 cannot be opened by 4.4. To carry data
+> across, generate a backup from **Settings → Data** on the 7.0 image, boot this one on an empty volume,
+> then restore. Alternatively, use the compose stack with `image: mongo:4.4`.
 
 To publish on a different host port, change the left side of the `-p` mapping — e.g. `-p 8080:3000`
 (the container always serves on `3000` internally; `MASQUERADARR_PORT` only applies to the compose stack).
@@ -304,7 +311,7 @@ each package and by running the app.
 | LG Channels | `makeFastSource` · Public mirror via `schedulelist` (catalog + XMLTV guide in one call) · direct-HLS masters bearing `[DEVICE_ID]/[UA]/[NONCE]/…` VAST macros · per-play macro expansion via `resolveStream` |
 | (**Local Now**) | Sentinel-resolve adapter · `localnow://<id>?slug=<slug>` stored at sync · resolves to a fresh signed CDN master per play · market-scoped channel set imported via `local/import.ts` · US-only (geo-gated) |
 | Plex | _(planned)_ |
-| DaddyLive | HTML catalog scraped from a runtime-selected rotating mirror (`mirrorDirectory.ts`) · `watch.php?id=<N>` entry sentinel · 3-hop, Referer-gated scrape per play to a fresh signed master · dynamic SSRF allow-set · self-EPG via schedule scrape + Gracenote crosswalk |
+| DaddyLive | HTML catalog scraped from a runtime-selected rotating mirror (`mirrorDirectory.ts`) · `watch.php?id=<N>` entry sentinel · 3-hop, Referer-gated scrape per play to a fresh signed playlist · **six independent embed providers per channel** ("Player 1..6"), walked and learned per channel (`playerMemory.ts`) with a provider-agnostic hop-2 reader (`embedExtractors.ts`) · dynamic SSRF allow-set · self-EPG via schedule scrape + Gracenote crosswalk |
 | Pluto TV | `makeFastSource` · sentinel+resolve · `/v2/guide/channels` catalog yields channel IDs only · stateful per-region boot session (`boot.pluto.tv`) · per-play JWT-stitched HLS master from the stitcher CDN |
 | STIRR | `makeFastSource` · sentinel+resolve · `videos/list` catalog yields video IDs + provider-EPG pointers · per-play resolve via `POST /playable` · bundled provider guide |
 | Samsung TV+ | `makeFastSource` · Public mirror (`i.mjh.nz`) · no auth · jmp2.uk short-link redirect followed per play to a rotating CDN master · dynamic SSRF allow-set learned at play time |
@@ -560,6 +567,41 @@ next playlist refetch.
 
 <img src="docs/diagrams/failover-groups.svg" alt="Failover groups end to end: the group modal writes three fields on each channel doc and cascades the parent's EPG identity; compose exports only the parent; at play time a failed ENTRY establish sends the Rust data plane through failover_walk, resolving each ordered Active child through Node's seam (200 grant, 502 try-the-next, 410 exhausted) until one answers, after which the stream's cursor sticks to the winning candidate.">
 
+## DaddyLive players (alternate upstreams)
+
+DaddyLive's channel pages offer **PLAYER 1..6**. These are **not** redundant embeds of one feed — each
+button loads a **different third-party provider**, and they do **not** all carry the same channels. Ch 648
+(Boomerang USA), verified live: Player 1's own CDN `404`s it, Players 2/3/5/6 are Cloudflare-gated, dead or
+NXDOMAIN, and only Player 4 — an entirely separate operator — actually carries it.
+
+So picking a player picks a **provider**, and which provider works varies per channel and drifts over time.
+The resolver is built around that:
+
+- **Provider-agnostic hop 2.** Any `<iframe>` on the player page is a candidate (the `/premiumtv/` embed is
+  simply tried first), and the signed playlist URL is read by an ordered chain of extractors —
+  base64/`atob`, plaintext, an XOR-array `eval` blob, a p·a·c·k·e·d payload, hex escapes
+  (`sources/adapters/dlhd/embedExtractors.ts`). Each recovers whatever constants the page carries rather
+  than hardcoding them, so a key rotation self-heals; a genuinely new obfuscation is a ~10-line addition.
+- **Both playlist shapes are valid.** Providers return either a master (`#EXT-X-STREAM-INF`) or a media
+  playlist (`#EXTINF`) — an `#EXTM3U` with neither is now rejected instead of being served as an empty stream.
+- **Learned + sticky.** The winning player is remembered per channel (~30 min) and a failing one is burnt
+  (~5 min), so the common case stays a **single** hop-1 fetch even when the winner isn't Player 1
+  (`playerMemory.ts`). The operator's pick — Settings → *DaddyLive Player Source*, or the per-channel
+  override in the channel drawer — always leads; the rest are the fallback order.
+- **Bounded.** Every hop has a timeout (`DLHD_HOP_TIMEOUT_MS`, 8 s) and the whole walk has a deadline
+  (`DLHD_RESOLVE_BUDGET_MS`, 20 s) so a hanging provider can't outlast a player's manifest timeout.
+- **Play-time rotation.** The data plane's first failover attempt re-resolves the same channel through a
+  *different provider* (the seam burns the one that was serving); only then does it start walking the
+  channel's configured [failover-group children](#failover-groups-channel-backups). Active Streams badges
+  the result — `failover → Player 4`.
+
+Knobs: `DLHD_PLAYER_STICKY_MS`, `DLHD_PLAYER_BURN_MS`, `DLHD_HOP_TIMEOUT_MS`, `DLHD_RESOLVE_BUDGET_MS`,
+plus the existing `DLHD_PLAYER` (source-wide default, also settable in the UI) and `DLHD_BASE`.
+
+> These providers are third parties that rotate — this layer is the most churn-prone part of the adapter by
+> design. When DaddyLive itself stops carrying a channel on **every** player, failover groups are the
+> durable answer.
+
 ## Playlists + EPG Sources with Playlist Binding
 
 Guide data reaches a playlist through **two distinct mechanisms** — keep them separate:
@@ -663,8 +705,13 @@ Per composed surface:
 
 > **Scope:** how masqueradarr actually serves video — a **remux-free Rust data-plane sidecar** (replacing an
 > older transcode engine) that resolves each stream on demand and pipes it durably to the player. This
-> section covers the two-plane split, the internal seams, the request path, the durability features, the
-> tunable config, and the opt-in public-edge topology.
+> section covers the two-plane split, the internal seams, the request path, the durability features,
+> [local origin mode](#local-origin-republishing-the-stream), the tunable config, and the opt-in public-edge
+> topology.
+>
+> **Remux-free is still true; "passthrough" no longer is.** Nothing is ever re-encoded — but with
+> [local origin](#local-origin-republishing-the-stream) enabled the engine stops forwarding the provider's
+> playlist and publishes one it wrote itself, from segments it ingested, decrypted and cached in RAM.
 
 ## Two planes: Node control plane · Rust data plane
 
@@ -727,6 +774,9 @@ The Rust engine is built to keep a stream alive on flaky upstreams:
   the failover walk below).
 - **Mirror failover** — a dead resolved master forces a **fresh resolve**, driving dlhd to re-probe and
   rotate to a live mirror mid-stream.
+- **Alternate upstreams** — where a source exposes several interchangeable providers per channel (dlhd's
+  Player 1..6), a failed establish first re-resolves the SAME channel through a **different provider**
+  before any configured backup is considered. See [DaddyLive players](#daddylive-players-alternate-upstreams).
 - **Failover groups** — when a channel has configured backups and its stream still won't establish, the
   engine walks the ordered children (`attempt=1,2,…` against the resolve seam) and serves the first live
   one under the parent's identity, then sticks to it for the session. See
@@ -737,8 +787,126 @@ The Rust engine is built to keep a stream alive on flaky upstreams:
   chunked / no-Content-Length byte undercount that used to fake client-side buffering.
 - **Batched telemetry** — events are coalesced and posted off the hot path, so reporting never blocks bytes.
 - **Raw MPEG-TS** — with `outputFormat: 'ts'`, an external-mount stream is served as **one continuous
-  `video/mp2t`** stream (segments concatenated, no remux) for players that prefer a flat TS pipe; fMP4 / AES
-  sources auto-fall back to HLS.
+  `video/mp2t`** stream (segments concatenated, no remux) for players that prefer a flat TS pipe. On the
+  passthrough path fMP4 / AES sources auto-fall back to HLS; with
+  [local origin](#local-origin-republishing-the-stream) enabled AES-128 is decrypted at ingest instead, so
+  only fMP4 and `SAMPLE-AES` still decline. A **demuxed** source needs more than concatenation — origin mode
+  [interleaves the pair](#demuxed-sources-and-the-interleaving-muxer) into one program rather than declining.
+
+## Local origin — republishing the stream
+
+Everything above describes a **rewriting proxy**: the upstream playlist is fetched, its URIs are rewritten to
+point back through masqueradarr, and the rest is passed through. That hides hostnames, but the client is still
+looking at the *provider's* timeline — their media sequence, their `#EXT-X-KEY`, even their vendor tags.
+
+With **`originEnabled`**, masqueradarr becomes the **origin** instead. One **ingest per channel** (not per
+viewer) follows the upstream, decrypts each segment, and pushes it into an in-memory **ring**; both output
+shapes are then rendered from that ring:
+
+<img src="docs/diagrams/local-origin.svg" alt="Local origin: Side-1 ingests once per channel (follow, fetch, decrypt) and pushes into a RAM ring; Side-2 reads the same ring to render either an authored HLS manifest or a continuous raw-TS socket for N viewers.">
+
+
+| | `originEnabled: false` | `originEnabled: true` |
+|---|---|---|
+| `outputFormat: 'hls'` | the upstream playlist, URI-rewritten | a playlist **we authored** + our own segment paths |
+| `outputFormat: 'ts'` | upstream segments concatenated per viewer | the same ring concatenated (decrypts); a demuxed source is **interleaved** into one program |
+
+What a player receives in origin mode contains **no provider host, path, session id or query; no
+`#EXT-X-KEY`; no vendor tags; no proxy hop URLs** — only our own `#EXT-X-MEDIA-SEQUENCE`, `#EXTINF`, and
+`/api/…/o/<entry>/<generation>-<seq>.ts` segment paths (still token-gated, since those paths are guessable by
+construction).
+
+Three consequences worth knowing:
+
+- **A second viewer of a channel costs no extra upstream bandwidth.** The passthrough path fetches per
+  viewer; the ring is shared.
+- **Encrypted sources become fully supported rather than degraded.** AES-128 is decrypted at ingest, so
+  `outputFormat: 'ts'` works on sources that previously fell back to HLS. `SAMPLE-AES` / FairPlay and fMP4
+  remain out of scope and decline cleanly, with a WARN naming the reason.
+- **Ad-stitched sources still show `#EXT-X-DISCONTINUITY`** at real splices. That is in-spec output, not a
+  leak — it says nothing about the origin — and every player handles it. The engine emits it only where the
+  upstream tags one, or where a media-sequence gap proves segments were missed; it deliberately does *not*
+  guess splices from URL shape (that was tried, and produced false positives on two different CDNs).
+
+### Demuxed sources and the interleaving muxer
+
+**Audio in its own `#EXT-X-MEDIA` rendition.** Some providers — pluto on every device
+cohort — offer no muxed variant at all: every `#EXT-X-STREAM-INF` defers its audio to a separate rendition
+playlist. Following the variant alone would ring, and serve, **video only**. The engine therefore rings the
+**pair**: one ring entry holds the video segment *and* its audio partner, and the entry URL answers with a
+small **master we author** over two media playlists of our own (`…/o/<entry>/v.m3u8` and
+`…/o/<entry>/a.m3u8`).
+
+Three properties make this safe, and all three are load-bearing:
+
+- **The pair is matched on the wall clock, not the sequence number.** `#EXT-X-PROGRAM-DATE-TIME` dates the
+  media itself, so it survives a renumbering; the media sequence only *looks* like a cross-rendition identity.
+  Pluto renumbers the two renditions independently across a session renewal — its stitcher ends the playlist
+  every ~25 s — so a fresh video playlist can open at sequence 10 against the audio's 11 **for the same
+  media**, and index pairing then puts every pair of that session about one segment out. The sequence index
+  remains the fallback for a source that publishes no PDT, where an aligned pair resolves to the same segment
+  either way. Each lane's *own* sequence still matters once a partner is picked: an absent `#EXT-X-KEY` IV is
+  derived from it (RFC 8216 §5.2), and the two lanes' numbers are exactly what diverge.
+- **One offset, both lanes.** A single affine shift is computed from the *video* lane's DTS and applied to
+  both renditions, so the source's authored A/V skew is translated rather than replaced. Computing an offset
+  per lane would manufacture a lip-sync error that was not in the source. A skew guard declines the pair
+  outright if the lanes' offset ever moves more than half a second from the skew locked on the first pair —
+  it bounds the DRIFT, not the skew's own magnitude, which a source is free to author as large as it likes —
+  and a declined pair publishes **both** lanes verbatim so they stay in sync with each other.
+- **Both lanes get the PID remap.** An ad creative is JIT-transmuxed into separate video and audio sources
+  with their own arbitrary PSI, so the pids churn on *both* sides of a pod edge — normalising only the video
+  would leave the audio track dying at every break.
+
+The two authored playlists are rendered from the same ring entries, so their media sequence, discontinuity
+sequence, `#EXTINF` ladder and `#EXT-X-PROGRAM-DATE-TIME` anchors are identical by construction.
+
+**`outputFormat: 'ts'` on a demuxed source — the interleaving muxer.** HLS can publish a pair as two
+playlists; raw TS is *one socket*, and two transport streams do not concatenate. That used to be a decline,
+which meant the one source shape local origin exists for was exactly the shape raw TS could not serve. It is
+now woven instead: the two lanes are folded into **one authored program** on the way out, off the same ring
+the HLS lanes are rendered from.
+
+The muxer is small because the pairing above already did the hard part — one shared clock, disjoint canonical
+pids, correct per-pid continuity counters. So the weave is transport-layer only, with **no decode, no
+re-encode and no timestamp rewriting**: drop each lane's PSI and padding, emit one PAT + one PMT declaring
+both elementary streams, and merge the two lanes' PES access units in **decode order** (video keyed on DTS,
+audio on PTS — for AAC they are the same thing). Per-pid packet order survives by construction, because an
+access unit is contiguous within its pid.
+
+Three details worth knowing:
+
+- **No PCR is generated.** The video lane's clock references were already shifted by the shared offset and the
+  merge keeps the video lane's relative order, so PCR stays monotonic and its spacing *in stream time* is
+  unchanged. The published PMT names the video pid as `PCR_PID`.
+- **The published program is locked** on the first woven pair and re-emitted byte-identically, on a ~110 ms
+  cadence so a demuxer that resyncs finds it again quickly. A later pair whose stream set differs is declined
+  rather than republished under a changed table — a PMT that changes shape mid-socket is itself a
+  reconfiguration event.
+- **A declined pair is skipped**, not served verbatim: there is no verbatim option when the output is one
+  socket. The reason is logged under `oop`, latched per distinct cause, and three consecutive declines end the
+  socket cleanly so the client reconnects instead of watching a stream that is open but frozen.
+
+`spliceNormalize` does **not** gate this path — it is the kill switch for splice *absorption*, but authoring
+one program out of two renditions requires the pid remap and shared clock to exist at all. Set
+`outputFormat: 'hls'` to publish the two renditions untouched.
+
+**RAM, not disk.** The ring holds *decrypted* media and is never written to disk. It is bounded per channel
+by `originRingMb` (default 25 MiB ≈ a minute at 3.3 Mbps), oldest segment evicted first, with a hard floor of
+3 segments so the window stays playable — when a source's bitrate makes the floor beat the cap, that is
+logged so the cap can be raised rather than leaving unexplained stalls. There is **no global ceiling across
+channels yet**, so a many-channel box wants a conservative per-channel value.
+
+**Bare-TS sources.** A `direct` / `hdhomerun` upstream arrives as one endless socket with no playlist, so the
+engine finds the boundaries itself: it reads the PSI tables (PAT → PMT) for the video PID and cuts at packets
+flagged as random-access points, deriving each segment's duration from the stream's own PCR clock. Those
+segments join the same ring, so such a source republishes as ordinary HLS.
+
+**Observability — `iop` vs `oop`.** Once one ingest feeds N viewers, ingress and egress are independent
+quantities, so a stuttering channel has two possible causes. The engine tags every ingest line **`iop`**
+(input operation — resolve, poll, fetch, decrypt, ring push/evict) and every serving line **`oop`** (output
+operation — manifest render, segment serve, TS concat), both under the `proxy` log category. Active Streams
+shows both sides per channel: `Delivery` is what viewers receive, `Ingest` / `Ring` / `Upstream pulled` is
+what the single shared ingest is doing.
 
 ## Tuning knobs — the `proxyconfigs` subsystem
 
@@ -755,6 +923,8 @@ resolved by Node into each grant (**Rust never reads MongoDB**). Two tiers, doc-
 | `connectTimeoutMs`, `maxRedirects` | live | per-config upstream HTTP client (cached in Rust) |
 | `readTimeoutMs`, `bufferSizeKb` | live | per-stream stall timeout + read-ahead buffer size |
 | `outputFormat` (`hls` \| `ts`) | live | distribution shape (`ts` = continuous MPEG-TS, external mount only) |
+| `originEnabled` | live | [local origin](#local-origin-republishing-the-stream): republish from our own ring instead of proxying the upstream playlist (default **off** = today's output byte-for-byte) |
+| `originRingMb` | live | per-channel ring cap in MiB (default **25**); a 3-segment floor still wins over it |
 | `failoverEnabled` | live | walk a channel's ordered failover children on an establish failure (default **on**) |
 | `failoverOnDefiniteError` | live | also treat a definitive upstream `4xx`/`5xx` as a failover trigger (default **off**) |
 | `segmentCacheTtlSec` | reserved | shipped in the grant, not yet enforced |
